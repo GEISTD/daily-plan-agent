@@ -1,3 +1,5 @@
 logs/
 __pycache__/
 *.pyc
+state.json
+plan_config.json

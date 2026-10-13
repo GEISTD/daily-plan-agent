@@ -5,6 +5,7 @@
 - 生成：桌面《学习计划_日期.md》+ dailyPlan 仓库 plans/ + practice/ 练习 .py 骨架
 - state.json 维护幂等：同一天重复运行不重复出题；题号只在确认后推进
 - 确认模式：python gen_daily.py --confirm → 归档全部未确认计划、推进题号、结算连续打卡
+- 自定义计划：--new-goal "目标" 调用 LLM 生成逐日计划；--import-plan 导入现成 JSON；--builtin 切回内置
 纯标准库，无第三方依赖。
 """
 import json, os, random, sys
@@ -216,6 +217,112 @@ SQL_DAYS = {
  "2026-10-14": "SQL Day3：窗口函数 ROW_NUMBER/RANK + RAG 元数据过滤场景 → 刷 184、185、197",
 }
 
+# ---------- 自定义计划（LLM 生成 / 手动导入，配置存 plan_config.json） ----------
+CONFIG_FILE = os.path.join(BASE, "plan_config.json")
+DEFAULT_BG = "大二计算机专业学生，有 C/C++ 基础，正在系统学习 AI 方向（Python/NumPy/PyTorch/机器学习）"
+
+def load_plan_cfg():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    return {"mode": "builtin"}
+
+def save_plan_cfg(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+def llm_cfg(cfg):
+    llm = dict(cfg.get("llm") or {})
+    llm.setdefault("base_url", "https://api.deepseek.com")
+    llm.setdefault("model", "deepseek-chat")
+    if not llm.get("api_key"):
+        llm["api_key"] = os.environ.get("LLM_API_KEY", "")
+    return llm
+
+def llm_chat(cfg, messages, timeout=180):
+    """OpenAI 兼容 /chat/completions 调用（纯标准库）。"""
+    import urllib.request
+    llm = llm_cfg(cfg)
+    if not llm["api_key"]:
+        raise RuntimeError(
+            "未配置 LLM API Key。方式1：在 plan_config.json 的 llm.api_key 填写；"
+            "方式2：设置环境变量 LLM_API_KEY；"
+            "方式3：用 --import-plan 导入任何聊天机器人生成的计划 JSON（无需 API）")
+    body = json.dumps({"model": llm["model"], "messages": messages,
+                       "temperature": 0.4, "stream": False}).encode("utf-8")
+    req = urllib.request.Request(
+        llm["base_url"].rstrip("/") + "/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + llm["api_key"]})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+def extract_json(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        i, j = text.find("{"), text.rfind("}")
+        if i >= 0 and j > i:
+            return json.loads(text[i:j + 1])
+        raise ValueError("LLM 输出不是有效 JSON")
+
+PLAN_PROMPT = """把下面的学习目标拆解成逐日学习计划。
+
+【学习目标】{goal}
+【周期】{start} 至 {end}（共 {ndays} 天，每天约 {minutes} 分钟）
+【学习者背景】{bg}
+
+要求：
+1. 划分为 3-8 个阶段，由浅入深，每个阶段有可检验的毕业标准（grad）。
+2. 逐日安排：每天任务具体可执行、一句话说清；理论与实践交替；每周至少 1 天复习/重写日；周末任务适当减轻；最后一天为综合实战日。
+3. 每天字段：stage(阶段名)、main(主任务)、hand(必须亲手完成的部分)、ai(可交给 AI 辅助的部分)、extra(20-40 分钟附加小任务，可为空字符串)。
+4. 只输出 JSON（不要 markdown 代码块、不要任何解释），结构：
+{{"milestones":[{{"stage":"阶段名","end":"YYYY-MM-DD","grad":"毕业标准"}}],"days":[{{"stage":"...","main":"...","hand":"...","ai":"...","extra":"..."}}]}}
+days 数组长度必须等于 {ndays}，顺序即日期顺序（第一天是 {start}）。"""
+
+def normalize_plan(data, start, end):
+    """把 LLM 输出规整为固定结构：日期按顺序强制对齐，缺失字段给默认值。"""
+    ndays = (end - start).days + 1
+    raw = data.get("days") or []
+    if len(raw) < max(1, int(ndays * 0.8)):
+        raise ValueError(f"天数不足：{len(raw)}/{ndays}")
+    days = []
+    for i in range(ndays):
+        s = raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
+        days.append({
+            "date": (start + timedelta(days=i)).isoformat(),
+            "stage": str(s.get("stage") or "综合推进"),
+            "main":  str(s.get("main") or s.get("task") or "（按本阶段主题继续推进）"),
+            "hand":  str(s.get("hand") or "核心部分亲手实现"),
+            "ai":    str(s.get("ai") or "调试、资料查询、代码 review"),
+            "extra": str(s.get("extra") or ""),
+        })
+    milestones = []
+    for m in data.get("milestones") or []:
+        if isinstance(m, dict) and m.get("stage"):
+            milestones.append({"stage": str(m["stage"]),
+                               "end": str(m.get("end") or ""),
+                               "grad": str(m.get("grad") or "完成本阶段全部任务")})
+    return {"milestones": milestones, "days": days}
+
+def gen_custom_plan(goal, start, end, minutes, background, cfg):
+    """调用 LLM 生成逐日计划；解析失败自动重试一次。"""
+    ndays = (end - start).days + 1
+    msgs = [{"role": "system", "content": "你是专业的学习计划制定师，只输出 JSON。"},
+            {"role": "user", "content": PLAN_PROMPT.format(
+                goal=goal, start=start.isoformat(), end=end.isoformat(),
+                ndays=ndays, minutes=minutes, bg=background)}]
+    last = None
+    for _ in range(2):
+        try:
+            return normalize_plan(extract_json(llm_chat(cfg, msgs)), start, end)
+        except Exception as e:
+            last = e
+            msgs.append({"role": "user", "content":
+                         f"上次输出无法使用（{e}）。请严格按要求的 JSON 结构重新输出，days 长度 {ndays}。"})
+    raise RuntimeError(f"LLM 生成计划失败：{last}")
+
 # ---------- 状态 ----------
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -234,6 +341,33 @@ def stage_of(d):
         if a <= iso <= b:
             return rest
     return ("计划外", "按 v3 计划复盘/休整（或提前开始下一阶段准备）", "复习本周手写代码", "—", "—")
+
+def plan_of(d):
+    """今日任务来源：自定义计划（plan_config.json mode=custom）或内置 STAGES。"""
+    iso = d.isoformat()
+    cfg = load_plan_cfg()
+    if cfg.get("mode") == "custom" and cfg.get("days"):
+        days = cfg["days"]
+        goal = cfg.get("goal", "")
+        for idx, x in enumerate(days):
+            if x["date"] == iso:
+                grad = ""
+                for m in cfg.get("milestones") or []:
+                    if m.get("stage") == x["stage"] and m.get("grad"):
+                        grad = m["grad"]
+                return {"station": x["stage"], "main": x["main"], "hand": x["hand"],
+                        "ai": x["ai"], "grad": grad or f"完成「{x['stage']}」阶段全部任务",
+                        "extra": x.get("extra", ""), "goal": goal,
+                        "day_no": idx + 1, "day_total": len(days)}
+        if iso < days[0]["date"]:
+            main = f"自定义计划将于 {days[0]['date']} 开始：{goal}（今天自由准备）"
+        else:
+            main = "本计划已到期。用 --new-goal 制定新计划，或 --builtin 切回内置计划"
+        return {"station": "自定义计划", "main": main, "hand": "—", "ai": "—", "grad": "—",
+                "extra": "", "goal": goal, "day_no": 0, "day_total": len(days)}
+    station, main, hand, ai, grad = stage_of(d)
+    return {"station": station, "main": main, "hand": hand, "ai": ai, "grad": grad,
+            "extra": SQL_DAYS.get(iso, ""), "goal": "", "day_no": 0, "day_total": 0}
 
 HELPER_LL = '''
 # ---- 链表工具（本地测试用，提交 LeetCode 时删掉这部分）----
@@ -403,19 +537,22 @@ def pick_question(d, state):
         review = False
     return Q[qi], review, qi
 
-def build_md(d, stage, qmeta, qi, review, qfname, state, carry=None):
-    station, main_task, hand, ai_help, grad = stage
+def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None):
     iso = d.isoformat()
     wd = WEEKDAYS[d.weekday()]
     num, qname, slug, diff, tags, sig, hint, cases = qmeta
     round_no = state["q_index"] // len(Q) + 1
     qtag = "复习重做" if review else f"第 {qi+1}/{len(Q)} 题（第 {round_no} 轮）"
     is_sunday = d.weekday() == 6
-    sql_line = SQL_DAYS.get(iso)
+    sql_line = plan.get("extra") or None
+    station, main_task = plan["station"], plan["main"]
+    hand, ai_help, grad = plan["hand"], plan["ai"], plan["grad"]
     L = []
     L.append(f"# 今日学习计划 · {iso} {wd}")
     L.append("")
     L.append(f"**当前技能站：{station}** ｜ 连续打卡：**{state['streak']} 天** ｜ 算法：{qtag}")
+    if plan.get("goal"):
+        L.append(f" ｜ 🎯 **{plan['goal']}**（Day {plan['day_no']}/{plan['day_total']}）")
     L.append("")
     if carry:
         L.append("> ⚠️ 有未确认的遗留计划：" + "、".join(carry) +
@@ -487,8 +624,9 @@ def main():
                                  "station": stage_of(today)[0], "status": "pending"}
 
     path, qfname = build_practice(qi, qmeta, today, review=review)
-    stage = stage_of(today)
-    md = build_md(today, stage, qmeta, qi, review, qfname, state, carry=carry)
+    plan = plan_of(today)
+    state["history"][iso]["station"] = plan["station"]
+    md = build_md(today, plan, qmeta, qi, review, qfname, state, carry=carry)
 
     plan_path = os.path.join(REPO_PLANS, f"{iso}.md")
     with open(plan_path, "w", encoding="utf-8") as f:
@@ -510,7 +648,7 @@ def main():
     qnum, qname = qmeta[0], qmeta[1]
     with open(summary, "w", encoding="utf-8") as f:
         f.write(f"今日计划已生成 | 连续 {state['streak']} 天\n")
-        f.write(f"{stage[0]}：{qnum}.{qname}（{'复习' if review else '新题'}）已就位\n")
+        f.write(f"{plan['station']}：{qnum}.{qname}（{'复习' if review else '新题'}）已就位\n")
 
     print(f"[OK] {iso} {WEEKDAYS[today.weekday()]} streak={state['streak']}")
     print(f"plan: {plan_path}")
@@ -555,8 +693,117 @@ def confirm():
     print("CONFIRMED:" + ",".join(pend))
     print(f"STREAK:{state['streak']}")
 
+# ---------- 自定义计划命令 ----------
+def arg_value(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args) and not args[i + 1].startswith("--"):
+            return args[i + 1]
+    return default
+
+def print_cfg_summary(cfg):
+    days = cfg.get("days") or []
+    print(f"模式: {cfg.get('mode')}  目标: {cfg.get('goal', '—')}")
+    print(f"周期: {cfg.get('start', '—')} ~ {cfg.get('end', '—')}"
+          f"（{len(days)} 天，每天约 {cfg.get('daily_minutes', '—')} 分钟）")
+    ms = {m["stage"]: m.get("grad", "") for m in cfg.get("milestones") or []}
+    cur, first, prev, cnt = None, "", "", 0
+    for x in days:
+        if x["stage"] != cur:
+            if cur is not None:
+                g = f"｜毕业：{ms[cur]}" if ms.get(cur) else ""
+                print(f"  · {cur}：{first} ~ {prev}（{cnt} 天）{g}")
+            cur, first, cnt = x["stage"], x["date"], 0
+        prev, cnt = x["date"], cnt + 1
+    if cur is not None:
+        g = f"｜毕业：{ms[cur]}" if ms.get(cur) else ""
+        print(f"  · {cur}：{first} ~ {prev}（{cnt} 天）{g}")
+
+def cmd_new_goal(args):
+    goal = arg_value(args, "--new-goal")
+    if not goal:
+        print('用法: python gen_daily.py --new-goal "目标" [--days 30 | --end 2026-11-15] '
+              '[--minutes 120] [--background "背景"]')
+        sys.exit(2)
+    cfg = load_plan_cfg()
+    start = date.today()
+    end_s = arg_value(args, "--end")
+    end = date.fromisoformat(end_s) if end_s else start + timedelta(days=int(arg_value(args, "--days", "30")) - 1)
+    ndays = (end - start).days + 1
+    if ndays < 1 or ndays > 90:
+        print("计划天数需在 1~90 天之间（更长的目标建议分段制定）")
+        sys.exit(2)
+    minutes = int(arg_value(args, "--minutes", str(cfg.get("daily_minutes", 120))))
+    background = arg_value(args, "--background", cfg.get("background") or DEFAULT_BG)
+    print(f"正在调用 LLM 生成 {ndays} 天逐日计划（{llm_cfg(cfg)['model']}）...")
+    try:
+        plan = gen_custom_plan(goal, start, end, minutes, background, cfg)
+    except Exception as e:
+        print(f"[失败] {e}")
+        sys.exit(1)
+    cfg.update({"mode": "custom", "goal": goal, "background": background,
+                "daily_minutes": minutes, "start": start.isoformat(), "end": end.isoformat(),
+                "milestones": plan["milestones"], "days": plan["days"]})
+    save_plan_cfg(cfg)
+    print("[OK] 自定义计划已保存：")
+    print_cfg_summary(cfg)
+    main()
+
+def cmd_import_plan(args):
+    path = arg_value(args, "--import-plan")
+    if not path or not os.path.exists(path):
+        print('用法: python gen_daily.py --import-plan plan.json [--goal "目标"]')
+        sys.exit(2)
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    raw = data.get("days") if isinstance(data, dict) else data
+    if not isinstance(raw, list) or not raw:
+        print("JSON 里需要非空的 days 数组")
+        sys.exit(2)
+    days = []
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict) or not s.get("date"):
+            print(f"days[{i}] 缺少 date 字段")
+            sys.exit(2)
+        days.append({"date": str(s["date"]), "stage": str(s.get("stage") or "自定义"),
+                     "main": str(s.get("main") or s.get("task") or ""),
+                     "hand": str(s.get("hand") or ""), "ai": str(s.get("ai") or ""),
+                     "extra": str(s.get("extra") or "")})
+    days.sort(key=lambda x: x["date"])
+    if len({x["date"] for x in days}) != len(days):
+        print("days 里有重复日期")
+        sys.exit(2)
+    cfg = load_plan_cfg()
+    goal = arg_value(args, "--goal") or (data.get("goal") if isinstance(data, dict) else "") or "自定义计划"
+    cfg.update({"mode": "custom", "goal": goal, "start": days[0]["date"], "end": days[-1]["date"],
+                "milestones": data.get("milestones", []) if isinstance(data, dict) else [],
+                "days": days})
+    save_plan_cfg(cfg)
+    print(f"[OK] 已导入 {len(days)} 天计划：")
+    print_cfg_summary(cfg)
+    main()
+
+def cmd_show_plan():
+    cfg = load_plan_cfg()
+    print_cfg_summary(cfg)
+    llm = llm_cfg(cfg)
+    print(f"LLM: {llm['base_url']} / {llm['model']} / key={'已配置' if llm.get('api_key') else '未配置'}")
+
 if __name__ == "__main__":
-    if "--confirm" in sys.argv:
+    args = sys.argv[1:]
+    if "--confirm" in args:
         confirm()
+    elif "--new-goal" in args:
+        cmd_new_goal(args)
+    elif "--import-plan" in args:
+        cmd_import_plan(args)
+    elif "--builtin" in args:
+        cfg = load_plan_cfg()
+        cfg["mode"] = "builtin"
+        save_plan_cfg(cfg)
+        print("[OK] 已切回内置计划")
+        main()
+    elif "--show-plan" in args:
+        cmd_show_plan()
     else:
         main()

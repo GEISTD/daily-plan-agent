@@ -78,6 +78,36 @@ CreateObject("Wscript.Shell").Run "powershell.exe -ExecutionPolicy Bypass -Windo
 
 卸载：`schtasks /Delete /TN AIPlan_OnLogon /F`（另有 AIPlan_Morning、AIPlan_Evening）。
 
+## 自定义学习计划（LLM 生成）
+
+不想用内置的 AI Engineer 时间表？说一句话，让 LLM 把你的目标拆成逐日计划：
+
+```powershell
+# 1. 复制配置模板，填入 API Key（任意 OpenAI 兼容接口，默认 DeepSeek）
+Copy-Item plan_config.example.json plan_config.json
+
+# 2. 一句话生成逐日计划（默认 30 天，每天 120 分钟，可用 --days/--end/--minutes/--background 调整）
+python gen_daily.py --new-goal "4 周从零学会 SQL，能写出复杂多表查询和窗口函数" --days 28
+
+# 3. 之后的每一天：计划自动生成 + Toast 推送 + 确认归档，机制与内置模式完全一致
+```
+
+LLM 会输出：3-8 个阶段（含毕业标准）+ 每一天的主任务 / 必须手写 / AI 可帮忙 / 附加小任务，存入 `plan_config.json`（含密钥，已 gitignore）。当天的计划立即切换为自定义内容，计划头部会显示「🎯 目标 + Day x/N」。
+
+**没有 API Key？** 用任何聊天机器人（DeepSeek/ChatGPT/Kimi…）按同样结构生成 JSON 文件，然后导入：
+
+```powershell
+python gen_daily.py --import-plan my_plan.json --goal "我的目标"
+```
+
+```json
+{"milestones": [{"stage": "阶段1", "end": "2026-10-20", "grad": "毕业标准"}],
+ "days": [{"date": "2026-10-14", "stage": "阶段1", "main": "主任务",
+           "hand": "必须手写", "ai": "可交给AI", "extra": "附加小任务"}]}
+```
+
+其他命令：`--show-plan` 查看当前计划概览；`--builtin` 一键切回内置计划；计划到期后系统会提示续期。单次最多生成 90 天，更长目标建议分段制定。
+
 ## 文件说明
 
 | 文件 | 作用 |
