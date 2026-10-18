@@ -217,6 +217,97 @@ SQL_DAYS = {
  "2026-10-14": "SQL Day3：窗口函数 ROW_NUMBER/RANK + RAG 元数据过滤场景 → 刷 184、185、197",
 }
 
+# ---------- 周末产出日：周六/周日每日任务后追加"可视化产出"项目 ----------
+# 键 = 技能站名关键词（按顺序取第一个命中）；无命中用 DEFAULT_WEEKEND。
+# 每个值 = 产出项目对列表，按 ISO 周数轮换（每周六/周日的项目不重复）。
+# 每对 = (周六项目, 周日项目)；字段：(项目名, 产出内容[强制复用已学知识], 成就感交付物[含 {W}=ISO周数])。
+DEFAULT_WEEKEND = (
+    ("📊 本周成果数据海报",
+     "把本周所有数字成果用 matplotlib 画成一张大图：损失曲线、准确率、错误案例统计（数据全部来自本周手写代码的真实输出，不许编造）。",
+     "交付：`learning-notes/产出墙/week{W}_成果海报.png` —— 发 GitHub/朋友圈，这就是你的进度铁证"),
+    ("🗺 本周知识地图",
+     "把本周核心概念、手写代码模块、踩过的坑画成一张思维导图（可手绘拍照，或 HTML/CSS 做），每个知识点标注对应代码文件。",
+     "交付：`learning-notes/产出墙/week{W}_知识地图.png` —— 明天花 3 分钟向 AI 讲一遍，讲得清才算会"),
+)
+WEEKEND_OUTPUT = {
+    "NumPy": (
+        ("📈 手写模型训练曲线动画",
+         "跑通手写逻辑回归，把每次迭代的损失用 matplotlib 画成动画/GIF，标注收敛点，并叠加 sklearn 参考虚线对比。复用：sigmoid/BCE/梯度下降/predict 全部手写代码。",
+         "交付：`learning-notes/产出墙/week{W}_logreg_curve.gif` + 写 3 行话解释它为什么收敛"),
+        ("🖼 三模型效果对比图",
+         "乳腺癌数据集上并排画：手写逻辑回归决策边界 / kNN 决策边界 / 混淆矩阵热力图，写 5 行话解释为什么结果不同。复用：S1 手写模型全部代码 + matplotlib。",
+         "交付：`learning-notes/产出墙/week{W}_model_compare.png` —— 这是『我能手写机器学习』的最强证据"),
+    ),
+    "PyTorch": (
+        ("🎥 模型训练过程可视化",
+         "把 PyTorch 训练循环每 10 步的损失和准确率收集起来，画成动画 GIF；再画 MLP/CNN 在 make_moons/CIFAR10 上的决策边界或特征图。复用：S2 全部手写训练循环 + S1 的 matplotlib 技能。",
+         "交付：`learning-notes/产出墙/week{W}_training_anim.gif` + 标注损失下降的 3 个阶段"),
+        ("🧠 网络结构 & 梯度流图",
+         "用你手写的反向传播推导，把 MLP/CNN 每层的形状变化、梯度大小画成一张结构图（可 draw.io 或 matplotlib），与 autograd 结果对比。复用：手推反向传播 + autograd 实验。",
+         "交付：`learning-notes/产出墙/week{W}_net_arch.png` —— 面试画图题直接用它"),
+    ),
+    "Transformer": (
+        ("🔥 Attention 热力图",
+         "用小矩阵跑通你手写的注意力，把 Q·K^T / softmax 结果画成热力图；再对 BERT 真实句子可视化 attention。复用：手写 Q/K/V、缩放点积注意力、掩码全部代码。",
+         "交付：`learning-notes/产出墙/week{W}_attention_heatmap.png` + 一句话解释模型在看什么"),
+        ("📉 微调收敛对比图",
+         "把『手写训练循环』和『Trainer』两条 loss 曲线画在一起对比收敛速度，并附 3 行结论。复用：S2 手写训练循环 + S3 微调实验。",
+         "交付：`learning-notes/产出墙/week{W}_finetune_compare.png` —— 写进简历项目描述"),
+    ),
+    "检索": (
+        ("⚖ TF-IDF vs 语义检索对比图",
+         "把 10 个测试问题在 TF-IDF 和 embedding 两种检索上的 recall@k 画成柱状图/折线图，标出各自赢的场景。复用：手写分块、TF-IDF、余弦相似度、向量检索全部代码。",
+         "交付：`learning-notes/产出墙/week{W}_retrieval_compare.png` + 5 行分析"),
+        ("📊 重排效果收益图",
+         "画混合重排前后 recall@k 的收益曲线（关键词+语义加权 vs 单一检索），标注在哪些 query 上重排救回来了。复用：手写重排加权 + recall@k 评估。",
+         "交付：`learning-notes/产出墙/week{W}_rerank_gain.png` —— RAG 检索毕业检查点材料"),
+    ),
+    "应用工程": (
+        ("🌐 FastAPI 接口演示页",
+         "给你手写的 FastAPI 问答服务做一张可交互演示页（HTML + JS 调 API），截图展示带引用的回答和错误处理。复用：Pydantic 模型 + 异步接口 + 错误处理全部手写。",
+         "交付：`learning-notes/产出墙/week{W}_api_demo.png`（+ 录屏 GIF），公网 URL 一起放进 README"),
+        ("🚀 部署架构图 & 实测报告",
+         "画 Docker 部署架构图（客户端→网关→FastAPI→检索→LLM），附公网实测响应时间表。复用：Dockerfile/compose 手写 + 云部署全流程。",
+         "交付：`learning-notes/产出墙/week{W}_deploy_arch.png` —— 简历架构图素材"),
+    ),
+    "Agent": (
+        ("🤖 Tool-use 调用流程图",
+         "把你手写的 tool 调用循环（查文档→算数值→回答）画成流程图，标注每步的输入输出和成本/延迟日志。复用：tool-use 循环 + 参数校验 + 日志全部手写。",
+         "交付：`learning-notes/产出墙/week{W}_tool_flow.png` + 一次真实调用的日志截图"),
+        ("⚔ LangChain 对比雷达图",
+         "手写版 vs LangChain 版在『代码量/可维护性/性能/延迟』四维打分，画雷达图，附 5 行结论。复用：手写检索+生成 vs 框架重构对比实验。",
+         "交付：`learning-notes/产出墙/week{W}_langchain_compare.png` —— 面试『为什么不用框架』的标准答案"),
+    ),
+    "投递": (
+        ("📮 投递进度看板",
+         "把 40+ 份投递记录画成可视化看板：按渠道/状态/回复率分组（可用 matplotlib 或 HTML 表格）。复用：Python 数据处理 + 可视化。",
+         "交付：`learning-notes/产出墙/week{W}_apply_board.png` —— 每周更新，越画越多越有底气"),
+        ("📚 错题 & GRE 复习墙",
+         "把本周算法错题和 GRE 生词画成 A4 复习海报（错题思路 + 生词 + 例句），打印贴墙。复用：错题复盘 + GRE 单词积累。",
+         "交付：`learning-notes/产出墙/week{W}_review_wall.png` —— 考前扫一眼的都是自己踩过的坑"),
+    ),
+    "面试": (
+        ("🎙 STAR 素材卡片墙",
+         "把积累的 10 条 STAR 素材每条画成一张卡片（S/T/A/R 四格 + 数字结果），A4 排版打印。复用：亲手整理的 STAR 素材库。",
+         "交付：`learning-notes/产出墙/week{W}_star_cards.png` —— 面试前 10 分钟过一遍"),
+        ("🏆 全周期成果时间线",
+         "把从 S1 到现在的全部产出画成一条时间线（阶段→产出→链接），做你的『学习主页』。复用：全部已学知识 + 产出墙素材。",
+         "交付：`learning-notes/产出墙/week{W}_timeline.png` —— 这就是你的求职作品集封面"),
+    ),
+}
+
+def weekend_project(d, station):
+    """周六/周日产出项目：按技能站关键词匹配 + 按 ISO 周数轮换（每周不重复）。"""
+    w = d.isocalendar()[1]
+    pairs = DEFAULT_WEEKEND
+    for key, val in WEEKEND_OUTPUT.items():
+        if key in station:
+            pairs = val
+            break
+    idx = w % len(pairs)
+    title, body, deliver = pairs[0 if d.weekday() == 5 else 1]
+    return title, body, deliver.format(W=w)
+
 # ---------- 自定义计划（LLM 生成 / 手动导入，配置存 plan_config.json） ----------
 CONFIG_FILE = os.path.join(BASE, "plan_config.json")
 DEFAULT_BG = "大二计算机专业学生，有 C/C++ 基础，正在系统学习 AI 方向（Python/NumPy/PyTorch/机器学习）"
@@ -537,13 +628,14 @@ def pick_question(d, state):
         review = False
     return Q[qi], review, qi
 
-def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None):
+def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, weekend=None):
     iso = d.isoformat()
     wd = WEEKDAYS[d.weekday()]
     num, qname, slug, diff, tags, sig, hint, cases = qmeta
     round_no = state["q_index"] // len(Q) + 1
     qtag = "复习重做" if review else f"第 {qi+1}/{len(Q)} 题（第 {round_no} 轮）"
     is_sunday = d.weekday() == 6
+    is_weekend = d.weekday() >= 5
     sql_line = plan.get("extra") or None
     station, main_task = plan["station"], plan["main"]
     hand, ai_help, grad = plan["hand"], plan["ai"], plan["grad"]
@@ -572,19 +664,29 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None):
         L.append(f"- [ ] **{sql_line}**")
     L.append("- [ ] **英语 30min**：GRE 单词 + 英文技术阅读")
     L.append("")
+    next_no = 3
+    if is_weekend and weekend:
+        w_title, w_body, w_deliver = weekend
+        L.append(f"## {next_no}. 🎨 周末产出日（可视化产出 · 用上学过的知识）")
+        L.append(f"- **{w_title}**")
+        L.append(f"- 📚 **融会贯通**：{w_body}")
+        L.append(f"- 🏆 {w_deliver}")
+        L.append("- 硬性规则：图里的数字必须是本周手写代码真实跑出来的，不许编造/手绘数据")
+        L.append("")
+        next_no += 1
     if is_sunday:
-        L.append("## 3. 周日特殊任务")
+        L.append(f"## {next_no}. 周日特殊任务")
         L.append("- [ ] **重写日 30min**：把本周 AI 帮写最多的一段核心代码删掉，凭理解重写一遍")
         L.append("- [ ] **Demo Day 30min**：做一个可展示产出（截图/录屏/GIF），写进 learning-notes/progress.md 产出墙")
         L.append("- [ ] **概念卡 10min**：复习本周+上周的概念卡")
         L.append("")
-        L.append("## 4. 手写 vs AI 红线")
-    else:
-        L.append("## 3. 手写 vs AI 红线")
+        next_no += 1
+    L.append(f"## {next_no}. 手写 vs AI 红线")
     L.append("- 顺序永远是 **先自己写 → 跑通 → 再让 AI review**，不要反过来")
     L.append("- 不粘贴没读懂的长代码；核心代码（损失/训练循环/检索/评估/路由）必须自己写")
     L.append("")
-    L.append(f"## {5 if is_sunday else 4}. 完成后（确认归档）")
+    next_no += 1
+    L.append(f"## {next_no}. 完成后（确认归档）")
     L.append("1. 练习文件本地跑通看到 `AC!`，主任务当天有 commit")
     L.append("2. **双击桌面「✅完成今日计划」**：本计划自动归档到 GitHub dailyPlan 仓库并删除本地文件，之后才推进新题")
     L.append("3. 没完成就不点确认：文件保留，明天继续攻克同一题（最小方案：练习文件写 1 行也是进步）")
@@ -626,7 +728,8 @@ def main():
     path, qfname = build_practice(qi, qmeta, today, review=review)
     plan = plan_of(today)
     state["history"][iso]["station"] = plan["station"]
-    md = build_md(today, plan, qmeta, qi, review, qfname, state, carry=carry)
+    weekend = weekend_project(today, plan["station"]) if today.weekday() >= 5 else None
+    md = build_md(today, plan, qmeta, qi, review, qfname, state, carry=carry, weekend=weekend)
 
     plan_path = os.path.join(REPO_PLANS, f"{iso}.md")
     with open(plan_path, "w", encoding="utf-8") as f:
