@@ -8,15 +8,42 @@
 - 自定义计划：--new-goal "目标" 调用 LLM 生成逐日计划；--import-plan 导入现成 JSON；--builtin 切回内置
 纯标准库，无第三方依赖。
 """
-import json, os, random, sys
+import importlib.util, json, os, random, re, subprocess, sys
 from datetime import date, datetime, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE, "logs")
 STATE_FILE = os.path.join(BASE, "state.json")
-# dailyPlan 归档仓库：默认取与本目录平级的 dailyPlan/（plans/=进行中 done/=已确认 practice/=手写练习）
-# 布局不同或想放别处？用环境变量 DAILY_PLAN_REPO 指向仓库根目录即可
-DAILY_REPO = os.environ.get("DAILY_PLAN_REPO") or os.path.join(os.path.dirname(BASE), "dailyPlan")
+# 供 ps1 读取的机器可读结果（Python 直接写 UTF-8，绕过 PS 捕获子进程输出的 GBK 乱码坑）
+LAST_RUN = os.path.join(BASE, "last_run.json")
+
+
+def write_run_result(obj):
+    with open(LAST_RUN, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+
+
+def _find_workspace_root():
+    p1 = os.path.dirname(BASE)
+    p2 = os.path.dirname(p1)
+    # 认准含 .git 的独立归档仓库 dailyPlan，避开 learning-notes/dailyPlan（仅存放 xlsx 的同名子目录）
+    if os.path.isdir(os.path.join(p1, "dailyPlan", ".git")):
+        return p1
+    if os.path.isdir(os.path.join(p2, "dailyPlan", ".git")):
+        return p2
+    return p2 if os.path.basename(p1) == "learning-notes" else p1
+
+
+WORKSPACE_ROOT = _find_workspace_root()
+# dailyPlan 归档仓库：plans/=进行中 done/=已确认 practice/=手写练习（可用环境变量覆盖）
+DAILY_REPO = os.environ.get("DAILY_PLAN_REPO") or os.path.join(WORKSPACE_ROOT, "dailyPlan")
+LEARNING_NOTES_DIR = (
+    os.path.dirname(BASE)
+    if os.path.basename(os.path.dirname(BASE)) == "learning-notes"
+    else os.path.join(WORKSPACE_ROOT, "learning-notes")
+)
+LC_NOTES_DIR = os.environ.get("LC_NOTES_DIR") or os.path.join(LEARNING_NOTES_DIR, "leetcode practice")
+IELTS_DIR = os.path.join(LEARNING_NOTES_DIR, "IELTS")
 REPO_PLANS = os.path.join(DAILY_REPO, "plans")
 REPO_DONE = os.path.join(DAILY_REPO, "done")
 PRAC_DIR = os.path.join(DAILY_REPO, "practice")
@@ -96,8 +123,221 @@ STAGES = [
 
 WEEKDAYS = ["周一","周二","周三","周四","周五","周六","周日"]
 
+# 周内主任务拆解：把整周相同的阶段大目标拆解为每天具体的推进节奏
+WEEKDAY_FOCUS = [
+    ("周一 · 原理拆解与骨架搭建", "厘清本周核心数学原理与输入输出接口，搭好代码目录与数据加载骨架"),
+    ("周二 · 核心模块手写攻关", "专注亲手实现「必须手写」中最核心的算法/网络层/梯度或损失逻辑，先跑通小样本"),
+    ("周三 · 完整流程与基线跑通", "串联完整训练/推理与评估循环，在真实数据集上跑出第一版 baseline 指标"),
+    ("周四 · 调优与对比实验", "对比参考实现或开展超参/消融实验（如学习率调度、正则化、不同配置），记录指标变化"),
+    ("周五 · 误差分析与代码收尾", "统计混淆矩阵与失败案例，整理注释与 README 用法示例，确保一条命令可复现"),
+    ("周六 · 可视化产出日联动", "提取本周手写代码的真实运行数据，完成下方「🎨 周末产出日」图表/动画"),
+    ("周日 · 脱稿重写与周验收", "完成下方「周日特殊任务」（核心代码重写 + 产出墙归档），对照本站毕业标准自检"),
+]
+
+DIFF_ZH = {"Easy": "简单", "Medium": "中等", "Hard": "困难"}
+
+
+def latest_ielts_file():
+    """查找 learning-notes/IELTS/ 下最新的 week*.md 笔记路径。"""
+    if not os.path.isdir(IELTS_DIR):
+        return r"D:\GEIST\learning-notes\IELTS"
+    best_num, best_path = -1, None
+    for name in os.listdir(IELTS_DIR):
+        if name.lower().endswith((".md", ".txt")):
+            m = re.search(r"(\d+)", name)
+            w = int(m.group(1)) if m else 0
+            if w >= best_num:
+                best_num, best_path = w, os.path.join(IELTS_DIR, name)
+    return best_path or IELTS_DIR
+
+
+def ensure_lc_note(qmeta, topic, iso, prac_path):
+    """在 learning-notes/leetcode practice/notes/ 下确保当日主练题的笔记模板存在，并在 README.md 登记进度。"""
+    if not os.path.isdir(LC_NOTES_DIR):
+        return None
+    num, qname, slug, diff, tags, sig, hint, _ = qmeta
+    notes_sub = os.path.join(LC_NOTES_DIR, "notes")
+    os.makedirs(notes_sub, exist_ok=True)
+    note_fname = f"{num:04d}-{qname}.md"
+    note_path = os.path.join(notes_sub, note_fname)
+    diff_zh = DIFF_ZH.get(diff, diff)
+
+    if not os.path.exists(note_path):
+        if "design" in tags:
+            code_stub = f"{sig}\n    pass"
+        else:
+            code_stub = f"class Solution:\n    {sig}\n        pass"
+        lines = [
+            f"# {num}. {qname}",
+            "",
+            f"- 链接：https://leetcode.cn/problems/{slug}/",
+            f"- 难度：{diff_zh}",
+            f"- 标签：{topic}",
+            f"- 日期：{iso}",
+            "- 状态：进行中",
+            f"- 本地文件：`{prac_path}`",
+            "",
+            "## 题目",
+            "",
+            "（用自己的话复述题目要求，包括输入、输出、约束条件）",
+            "",
+            "## 我的理解",
+            "",
+            "（这题到底在问什么？边界情况有哪些？）",
+            "",
+            "## 第一版思路",
+            "",
+            "（先自己写，写清楚打算怎么做、为什么这么做）",
+            "",
+            "## 卡点 / 我问的问题",
+            "",
+            "1. ",
+            "2. ",
+            "",
+            "## AI 讲解",
+            "",
+            "（关键点是什么？原思路哪里不对？正确思路是怎么一步步想到的？）",
+            "",
+            "## 代码",
+            "",
+            "```python",
+            code_stub,
+            "```",
+            "",
+            "- 时间复杂度：",
+            "- 空间复杂度：",
+            "",
+            "## 一句话总结",
+            "",
+            "（下次遇到同类题，第一反应应该想什么）",
+            "",
+            "## 复习标记",
+            "",
+            "- 第一次重做：还没做",
+            "- 是否能不看答案写出来：",
+            "",
+        ]
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r", encoding="utf-8-sig") as f:
+                content = f.read()
+            row_key = f"| {num:04d} |"
+            new_row = f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | 进行中 | {iso} |"
+            if row_key not in content:
+                lines = content.splitlines()
+                insert_at = None
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("|---"):
+                        insert_at = i + 1
+                    elif insert_at is not None and line.strip().startswith("|"):
+                        insert_at = i + 1
+                    elif insert_at is not None and not line.strip().startswith("|"):
+                        break
+                if insert_at is not None:
+                    lines.insert(insert_at, new_row)
+                    with open(readme_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            print("lc readme update failed:", e, file=sys.stderr)
+    return note_path
+
+
+def _extract_user_code(prac_path):
+    """从练习文件中提取手写实现代码（若仍是初始 pass 模板则返回 None）。"""
+    if not prac_path or not os.path.exists(prac_path):
+        return None
+    try:
+        with open(prac_path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except Exception:
+        return None
+    marker = "# ---- 本地测试"
+    idx = text.find(marker)
+    body = text[:idx] if idx > 0 else text
+    m = re.search(r"^(class\s+\w+[\s\S]+)", body, re.MULTILINE)
+    if not m:
+        return None
+    code_block = m.group(1).strip()
+    # 去掉 docstring 和注释后看是否只有 class/def/pass
+    stripped = re.sub(r'""".*?"""', "", code_block, flags=re.DOTALL)
+    meaningful = [
+        ln.strip() for ln in stripped.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+        and not ln.strip().startswith("class ")
+        and not ln.strip().startswith("def ")
+    ]
+    if not meaningful or meaningful == ["pass"]:
+        return None
+    return code_block
+
+
+def _find_practice_file(iso, num, slug):
+    """查找某日某题对应的练习文件路径。"""
+    mm_dd = iso[5:]
+    candidates = [
+        f"{mm_dd}_lc{num}_{slug}_review.py",
+        f"{mm_dd}_lc{num}_{slug}.py",
+    ]
+    for c in candidates:
+        p = os.path.join(PRAC_DIR, c)
+        if os.path.exists(p):
+            return p, c
+    prefix = f"{mm_dd}_lc{num}_{slug}"
+    if os.path.isdir(PRAC_DIR):
+        for fn in os.listdir(PRAC_DIR):
+            if fn.startswith(prefix) and fn.endswith(".py"):
+                return os.path.join(PRAC_DIR, fn), fn
+    return os.path.join(PRAC_DIR, candidates[1]), candidates[1]
+
+
+def mark_lc_note_ac(qi, iso, review=False):
+    """确认归档时：将对应题目的刷题笔记与 README 进度表状态更新为 AC，并自动同步已手写的代码。"""
+    if not os.path.isdir(LC_NOTES_DIR):
+        return
+    qmeta = qmeta_of(qi)
+    topic = lc_entry(qi)[0]
+    num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
+    prac_path, _ = _find_practice_file(iso, num, slug)
+    note_path = ensure_lc_note(qmeta, topic, iso, prac_path)
+    if note_path and os.path.exists(note_path):
+        try:
+            with open(note_path, "r", encoding="utf-8-sig") as f:
+                nt = f.read()
+            nt = re.sub(r"^- 状态：.*$", "- 状态：AC", nt, flags=re.MULTILINE)
+            if review:
+                nt = re.sub(r"^- 第一次重做：还没做\s*$", f"- 第一次重做：{iso} 已复习重做", nt, flags=re.MULTILINE)
+            user_code = _extract_user_code(prac_path)
+            if user_code:
+                nt = re.sub(
+                    r"(## 代码\s+```python\n)class\s+\w+[\s\S]*?pass(\n```)",
+                    lambda m: m.group(1) + user_code + m.group(2),
+                    nt,
+                    count=1,
+                )
+            with open(note_path, "w", encoding="utf-8") as f:
+                f.write(nt)
+        except Exception as e:
+            print("mark lc note failed:", e, file=sys.stderr)
+
+    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r", encoding="utf-8-sig") as f:
+                rc = f.read()
+            pattern = rf"^(\|\s*{num:04d}\s*\|[^|]+\|[^|]+\|[^|]+\|\s*)(?:进行中|未开始)(\s*\|[^|]+\|)$"
+            rc_new = re.sub(pattern, r"\1AC\2", rc, flags=re.MULTILINE)
+            if rc_new != rc:
+                with open(readme_path, "w", encoding="utf-8") as f:
+                    f.write(rc_new)
+        except Exception as e:
+            print("mark lc readme failed:", e, file=sys.stderr)
+
 # ---------- LeetCode 题库：(题号, 题名, slug, 难度, 标签, 方法签名, 思路提示, 用例) ----------
-# 标签: ll=链表 tree=二叉树 design=设计题；用例 None = 给测试建议注释
+# 标签: ll=链表 tree=二叉树 design=设计题 set_eq=无序结果集 lol_eq=无序二维列表
 Q = [
  (283,"移动零","move-zeroes","Easy",{"inplace"},"def moveZeroes(self, nums: List[int]) -> None:  # 原地修改",
   "快慢双指针：慢指针指向下一个非零应放的位置，快指针扫描；最后把慢指针之后全置 0",
@@ -116,8 +356,8 @@ Q = [
   "滑动窗口：右指针扩张，窗口和≥target 时左指针收缩并更新最小长度",[([7,[2,3,1,2,4,3]],2)]),
  (3,"无重复字符的最长子串","longest-substring-without-repeating-characters","Medium",set(),"def lengthOfLongestSubstring(self, s: str) -> int:",
   "滑动窗口+集合/哈希记录窗口内字符；重复时左指针收缩到无重复",[(["abcabcbb"],3)]),
- (15,"三数之和","3sum","Medium",set(),"def threeSum(self, nums: List[int]) -> List[List[int]]:",
-  "排序后固定一个数，剩下用对撞双指针；三处去重（固定位、左右指针）",None),
+ (15,"三数之和","3sum","Medium",{"lol_eq"},"def threeSum(self, nums: List[int]) -> List[List[int]]:",
+  "排序后固定一个数，剩下用对撞双指针；三处去重（固定位、左右指针）",[([[-1,0,1,2,-1,-4]],[[-1,-1,2],[-1,0,1]])]),
  (1,"两数之和","two-sum","Easy",set(),"def twoSum(self, nums: List[int], target: int) -> List[int]:",
   "哈希表扫一遍：查 target-x 是否已在表中，在则返回，不在则存入",[([[2,7,11,15],9],[0,1])]),
  (206,"反转链表","reverse-linked-list","Easy",{"ll"},"def reverseList(self, head: Optional[ListNode]) -> Optional[ListNode]:",
@@ -125,39 +365,46 @@ Q = [
  (21,"合并两个有序链表","merge-two-sorted-lists","Easy",{"ll"},"def mergeTwoLists(self, list1: Optional[ListNode], list2: Optional[ListNode]) -> Optional[ListNode]:",
   "哑节点 dummy + 双指针逐个接较小节点，剩余直接接上",[([[1,2,4],[1,3,4]],[1,1,2,3,4,4])]),
  (141,"环形链表","linked-list-cycle","Easy",{"ll"},"def hasCycle(self, head: Optional[ListNode]) -> bool:",
-  "快慢指针（1步/2步），相遇即有环；None 则无环",None),
+  "快慢指针（1步/2步），相遇即有环；None 则无环",[([[3,2,0,-4],1],True),([[1],-1],False)]),
  (876,"链表的中间结点","middle-of-the-linked-list","Easy",{"ll"},"def middleNode(self, head: Optional[ListNode]) -> Optional[ListNode]:",
   "快慢指针同起点，快到尾时慢在中间（偶数个取第二个中间）",[([[1,2,3,4,5]],[3,4,5])]),
  (20,"有效的括号","valid-parentheses","Easy",set(),"def isValid(self, s: str) -> bool:",
   "栈：左括号入栈，右括号检查栈顶是否匹配；最后栈空才合法",[(["()[]{}"],True),(["(]"],False)]),
- (155,"最小栈","min-stack","Medium",{"design"},"class MinStack:  # 每个方法都要实现",
-  "辅助栈：与主栈同步 push，栈顶永远是当前最小值（可存 (val,min) 元组）",None),
+ (155,"最小栈","min-stack","Medium",{"design"},"class MinStack:  # push/pop/top/getMin",
+  "辅助栈：与主栈同步 push，栈顶永远是当前最小值（可存 (val,min) 元组）",
+  ["s = MinStack(); s.push(-2); s.push(0); s.push(-3)",
+   "assert s.getMin() == -3",
+   "s.pop(); assert s.top() == 0 and s.getMin() == -2"]),
  (232,"用栈实现队列","implement-queue-using-stacks","Easy",{"design"},"class MyQueue:  # push/peek/pop/empty",
-  "双栈：in 栈管入队，peek/pop 时若 out 栈空则把 in 全部倒进 out",None),
+  "双栈：in 栈管入队，peek/pop 时若 out 栈空则把 in 全部倒进 out",
+  ["q = MyQueue(); q.push(1); q.push(2)",
+   "assert q.peek() == 1 and q.pop() == 1 and not q.empty()"]),
  (739,"每日温度","daily-temperatures","Medium",set(),"def dailyTemperatures(self, temperatures: List[int]) -> List[int]:",
   "单调递减栈存下标；当前温度更高时弹栈，距离=下标差",[([[73,74,75,71,69,72,76,73]],[1,1,4,2,1,1,0,0])]),
  (225,"用队列实现栈","implement-stack-using-queues","Easy",{"design"},"class MyStack:  # push/top/pop/empty",
-  "单队列：每次 push 后把前面的元素依次出队再入队，新元素就到了队首",None),
+  "单队列：每次 push 后把前面的元素依次出队再入队，新元素就到了队首",
+  ["s = MyStack(); s.push(1); s.push(2)",
+   "assert s.top() == 2 and s.pop() == 2 and not s.empty()"]),
  (42,"接雨水","trapping-rain-water","Hard",set(),"def trap(self, height: List[int]) -> int:",
   "对撞双指针+左右最大高度：每次处理较矮一侧（选做，先理解按列求 min(左max,右max)-h）",[([[0,1,0,2,1,0,1,3,2,1,2,1]],6)]),
- (49,"字母异位词分组","group-anagrams","Medium",set(),"def groupAnagrams(self, strs: List[str]) -> List[List[str]]:",
-  "排序后的字符串作为哈希 key 分组（或用 26 字母计数元组）",None),
- (349,"两个数组的交集","intersection-of-two-arrays","Easy",set(),"def intersection(self, nums1: List[int], nums2: List[int]) -> List[int]:",
-  "两个 set 求交集即可",None),
+ (49,"字母异位词分组","group-anagrams","Medium",{"lol_eq"},"def groupAnagrams(self, strs: List[str]) -> List[List[str]]:",
+  "排序后的字符串作为哈希 key 分组（或用 26 字母计数元组）",[([["eat","tea","tan","ate","nat","bat"]],[["ate","eat","tea"],["bat"],["nat","tan"]])]),
+ (349,"两个数组的交集","intersection-of-two-arrays","Easy",{"set_eq"},"def intersection(self, nums1: List[int], nums2: List[int]) -> List[int]:",
+  "两个 set 求交集即可",[([[1,2,2,1],[2,2]],[2]),([[4,9,5],[9,4,9,8,4]],[4,9])]),
  (128,"最长连续序列","longest-consecutive-sequence","Medium",set(),"def longestConsecutive(self, nums: List[int]) -> int:",
   "哈希集合；只从 x-1 不存在的起点开始数 x+1,x+2…，保证 O(n)",[([[100,4,200,1,3,2]],4)]),
  (202,"快乐数","happy-number","Easy",set(),"def isHappy(self, n: int) -> bool:",
   "哈希集合检测循环：重复出现且不为 1 就不快乐（也可用快慢指针）",[([19],True),([2],False)]),
- (350,"两个数组的交集 II","intersection-of-two-arrays-ii","Easy",set(),"def intersect(self, nums1: List[int], nums2: List[int]) -> List[int]:",
-  "哈希表计数：短表计数，长表每匹配一个就计数-1 并加入答案",None),
+ (350,"两个数组的交集 II","intersection-of-two-arrays-ii","Easy",{"set_eq"},"def intersect(self, nums1: List[int], nums2: List[int]) -> List[int]:",
+  "哈希表计数：短表计数，长表每匹配一个就计数-1 并加入答案",[([[1,2,2,1],[2,2]],[2,2]),([[4,9,5],[9,4,9,8,4]],[4,9])]),
  (704,"二分查找","binary-search","Easy",set(),"def search(self, nums: List[int], target: int) -> int:",
   "标准闭区间二分 [l,r]：l<=r，mid=(l+r)//2，找不到返回 -1",[([[-1,0,3,5,9,12],9],4)]),
  (35,"搜索插入位置","search-insert-position","Easy",set(),"def searchInsert(self, nums: List[int], target: int) -> int:",
   "二分找第一个 ≥ target 的位置；全部小于 target 则返回 len",[([[1,3,5,6],5],2)]),
  (34,"查找元素首尾位置","find-first-and-last-position-of-element-in-sorted-array","Medium",set(),"def searchRange(self, nums: List[int], target: int) -> List[int]:",
-  "两次二分：一次找左边界（≥target 第一个），一次找右边界（≤target 最后一个）",None),
+  "两次二分：一次找左边界（≥target 第一个），一次找右边界（≤target 最后一个）",[([[5,7,7,8,8,10],8],[3,4]),([[5,7,7,8,8,10],6],[-1,-1])]),
  (33,"搜索旋转排序数组","search-in-rotated-sorted-array","Medium",set(),"def search(self, nums: List[int], target: int) -> int:",
-  "二分时判断哪半边有序（nums[mid] 与 nums[l] 比较），再决定 target 是否在有序半边",None),
+  "二分时判断哪半边有序（nums[mid] 与 nums[l] 比较），再决定 target 是否在有序半边",[([[4,5,6,7,0,1,2],0],4),([[4,5,6,7,0,1,2],3],-1)]),
  (69,"x 的平方根","sqrtx","Easy",set(),"def mySqrt(self, x: int) -> int:",
   "二分答案 [0,x]：mid²≤x 记录答案并向右找，否则向左",[([8],2),([4],2)]),
  (144,"二叉树前序遍历","binary-tree-preorder-traversal","Easy",{"tree"},"def preorderTraversal(self, root: Optional[TreeNode]) -> List[int]:",
@@ -177,19 +424,19 @@ Q = [
  (110,"平衡二叉树","balanced-binary-tree","Easy",{"tree"},"def isBalanced(self, root: Optional[TreeNode]) -> bool:",
   "后序返回高度；左右高度差>1 返回 -1 表示不平衡并一路上传",[([[3,9,20,None,None,15,7]],True)]),
  (236,"最近公共祖先","lowest-common-ancestor-of-a-binary-tree","Medium",{"tree"},"def lowestCommonAncestor(self, root: 'TreeNode', p: 'TreeNode', q: 'TreeNode') -> 'TreeNode':",
-  "后序递归：左右子树各找到一个 → 当前节点就是 LCA；自己命中则返回自己",None),
+  "后序递归：左右子树各找到一个 → 当前节点就是 LCA；自己命中则返回自己",[([[3,5,1,6,2,0,8,None,None,7,4]],3)]),
  (112,"路径总和","path-sum","Easy",{"tree"},"def hasPathSum(self, root: Optional[TreeNode], targetSum: int) -> bool:",
   "DFS 每经过节点减去其值，到叶子判剩余是否为 0",[([[5,4,8,11,None,13,4,7,2,None,None,None,1],22],True)]),
  (124,"二叉树最大路径和","binary-tree-maximum-path-sum","Hard",{"tree"},"def maxPathSum(self, root: Optional[TreeNode]) -> int:",
-  "后序：贡献值=node.val+max(0,左贡献,右贡献)；经过当前节点的路径=node+左贡献+右贡献",None),
+  "后序：贡献值=node.val+max(0,左贡献,右贡献)；经过当前节点的路径=node+左贡献+右贡献",[([[1,2,3]],6),([[-10,9,20,None,None,15,7]],42)]),
  (200,"岛屿数量","number-of-islands","Medium",set(),"def numIslands(self, grid: List[List[str]]) -> int:",
   "遍历网格，遇到 '1' 计数+1 并 DFS/BFS 把相邻陆地全部淹没成 '0'",[([[["1","1","0","0","0"],["1","1","0","0","0"],["0","0","1","0","0"],["0","0","0","1","1"]]],3)]),
  (695,"岛屿的最大面积","max-area-of-islands","Medium",set(),"def maxAreaOfIsland(self, grid: List[List[int]]) -> int:",
-  "DFS 返回当前岛屿面积（1+四方向之和），全程维护最大值",None),
+  "DFS 返回当前岛屿面积（1+四方向之和），全程维护最大值",[([[[0,0,1,0,0],[0,1,1,1,0],[0,0,0,0,0]]],4)]),
  (994,"腐烂的橘子","rotting-oranges","Medium",set(),"def orangesRotting(self, grid: List[List[int]]) -> int:",
-  "多源 BFS：所有腐烂橘子同时入队，按分钟层序扩散；最后还有新鲜橘子返回 -1",None),
+  "多源 BFS：所有腐烂橘子同时入队，按分钟层序扩散；最后还有新鲜橘子返回 -1",[([[[2,1,1],[1,1,0],[0,1,1]]],4),([[[2,1,1],[0,1,1],[1,0,1]]],-1)]),
  (207,"课程表","course-schedule","Medium",set(),"def canFinish(self, numCourses: int, prerequisites: List[List[int]]) -> bool:",
-  "拓扑排序：建邻接表+入度数组，入度 0 入队，出队即学完并解锁后续；全部学完=无环",None),
+  "拓扑排序：建邻接表+入度数组，入度 0 入队，出队即学完并解锁后续；全部学完=无环",[([2,[[1,0]]],True),([2,[[1,0],[0,1]]],False)]),
  (70,"爬楼梯","climbing-stairs","Easy",set(),"def climbStairs(self, n: int) -> int:",
   "dp[i]=dp[i-1]+dp[i-2]；只需两个变量滚动，O(1) 空间",[([2],2),([3],3),([4],5)]),
  (198,"打家劫舍","house-robber","Medium",set(),"def rob(self, nums: List[int]) -> int:",
@@ -197,28 +444,167 @@ Q = [
  (53,"最大子数组和","maximum-subarray","Medium",set(),"def maxSubArray(self, nums: List[int]) -> int:",
   "以 i 结尾的最大和=max(nums[i], 之前最优+nums[i])，滚动维护全局最大",[([[-2,1,-3,4,-1,2,1,-5,4]],6)]),
  (322,"零钱兑换","coin-change","Medium",set(),"def coinChange(self, coins: List[int], amount: int) -> int:",
-  "完全背包：dp[金额]=最少硬币数，初始化无穷大，逐硬币更新",None),
+  "完全背包：dp[金额]=最少硬币数，初始化无穷大，逐硬币更新",[([[1,2,5],11],3),([[2],3],-1)]),
  (62,"不同路径","unique-paths","Medium",set(),"def uniquePaths(self, m: int, n: int) -> int:",
   "二维 dp：dp[i][j]=dp[i-1][j]+dp[i][j-1]，首行首列全 1",[([3,7],28)]),
  (1143,"最长公共子序列","longest-common-subsequence","Medium",set(),"def longestCommonSubsequence(self, text1: str, text2: str) -> int:",
-  "二维 dp：字符相等取对角+1，否则取上/左的较大值",None),
- (46,"全排列","permutations","Medium",set(),"def permute(self, nums: List[int]) -> List[List[int]]:",
-  "回溯 + used 数组：每层选一个未使用元素，撤销选择",None),
- (78,"子集","subsets","Medium",set(),"def subsets(self, nums: List[int]) -> List[List[int]]:",
-  "回溯：每个元素选或不选，每次进入递归都收集当前路径",None),
- (39,"组合总和","combination-sum","Medium",set(),"def combinationSum(self, candidates: List[int], target: int) -> List[List[int]]:",
-  "回溯+可重复选（start 不递增）；先排序便于剩余值为负时剪枝",None),
+  "二维 dp：字符相等取对角+1，否则取上/左的较大值",[(["abcde","ace"],3),(["abc","def"],0)]),
+ (46,"全排列","permutations","Medium",{"lol_eq"},"def permute(self, nums: List[int]) -> List[List[int]]:",
+  "回溯 + used 数组：每层选一个未使用元素，撤销选择",[([[1,2,3]],[[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]])]),
+ (78,"子集","subsets","Medium",{"lol_eq"},"def subsets(self, nums: List[int]) -> List[List[int]]:",
+  "回溯：每个元素选或不选，每次进入递归都收集当前路径",[([[1,2,3]],[[],[1],[2],[3],[1,2],[1,3],[2,3],[1,2,3]])]),
+ (39,"组合总和","combination-sum","Medium",{"lol_eq"},"def combinationSum(self, candidates: List[int], target: int) -> List[List[int]]:",
+  "回溯+可重复选（start 不递增）；先排序便于剩余值为负时剪枝",[([[2,3,6,7],7],[[2,2,3],[7]])]),
 ]
 
-# SQL 速通（仅 10-12~10-14）
-SQL_DAYS = {
- "2026-10-12": "SQL Day1：单表查询（WHERE/ORDER/LIKE/IN/IS NULL）→ 刷 LeetCode 175、176、177",
- "2026-10-13": "SQL Day2：GROUP BY/HAVING/JOIN/子查询 → 刷 181、182、183",
- "2026-10-14": "SQL Day3：窗口函数 ROW_NUMBER/RANK + RAG 元数据过滤场景 → 刷 184、185、197",
+# SQL 暂缓（用户要求后置；恢复时按 LeetCode Database 题号顺序 175→181→… 接续安排）
+SQL_DAYS = {}
+
+# ---------- LC 闯关模式：主任务 = LeetCode 主题闯关（AI 主任务/SQL 暂缓） ----------
+# 每天 1 道主练（在 Q 中有骨架/提示/用例）+ 2 道举一反三（同主题，网页直接做）
+LC_FOCUS = True
+# (主题, 主练题号, [(题号, 题名, slug, 难度), (题号, 题名, slug, 难度)])
+LC_PLAN = [
+ ("双指针", 283, [(344,"反转字符串","reverse-string","Easy"),(125,"验证回文串","valid-palindrome","Easy")]),
+ ("双指针", 26, [(88,"合并两个有序数组","merge-sorted-array","Easy"),(392,"判断子序列","is-subsequence","Easy")]),
+ ("双指针", 27, [(455,"分发饼干","assign-cookies","Easy"),(905,"按奇偶排序数组","sort-array-by-parity","Easy")]),
+ ("双指针", 977, [(345,"反转字符串中的元音字母","reverse-vowels-of-a-string","Easy"),(941,"有效的山脉数组","valid-mountain-array","Easy")]),
+ ("双指针", 167, [(121,"买卖股票的最佳时机","best-time-to-buy-and-sell-stock","Easy"),(122,"买卖股票的最佳时机 II","best-time-to-buy-and-sell-stock-ii","Medium")]),
+ ("双指针", 11, [(16,"最接近的三数之和","3sum-closest","Medium"),(18,"四数之和","4sum","Medium")]),
+ ("双指针", 15, [(454,"四数相加 II","4sum-ii","Medium"),(532,"数组中的 k-diff 数对","k-diff-pairs-in-an-array","Medium")]),
+ ("滑动窗口", 209, [(643,"子数组最大平均数 I","maximum-average-subarray-i","Easy"),(438,"找到字符串中所有字母异位词","find-all-anagrams-in-a-string","Medium")]),
+ ("滑动窗口", 3, [(567,"字符串的排列","permutation-in-string","Medium"),(219,"存在重复元素 II","contains-duplicate-ii","Easy")]),
+ ("哈希表", 1, [(217,"存在重复元素","contains-duplicate","Easy"),(242,"有效的字母异位词","valid-anagram","Easy")]),
+ ("哈希表", 49, [(383,"赎金信","ransom-note","Easy"),(136,"只出现一次的数字","single-number","Easy")]),
+ ("哈希表", 349, [(268,"丢失的数字","missing-number","Easy"),(448,"找到所有数组中消失的数字","find-all-numbers-disappeared-in-an-array","Easy")]),
+ ("哈希表", 350, [(387,"字符串中的第一个唯一字符","first-unique-character-in-a-string","Easy"),(205,"同构字符串","isomorphic-strings","Easy")]),
+ ("哈希表", 202, [(290,"单词规律","word-pattern","Easy"),(409,"最长回文串","longest-palindrome","Easy")]),
+ ("哈希表", 128, [(380,"O(1)时间插入删除获取随机元素","insert-delete-getrandom-o1","Medium"),(299,"猜数字游戏","bulls-and-cows","Medium")]),
+ ("二分查找", 704, [(278,"第一个错误的版本","first-bad-version","Easy"),(374,"猜数字大小","guess-number-higher-or-lower","Easy")]),
+ ("二分查找", 35, [(367,"有效的完全平方数","valid-perfect-square","Easy"),(50,"Pow(x, n)","powx-n","Medium")]),
+ ("二分查找", 69, [(153,"寻找旋转排序数组中的最小值","find-minimum-in-rotated-sorted-array","Medium"),(162,"寻找峰值","find-peak-element","Medium")]),
+ ("二分查找", 34, [(74,"搜索二维矩阵","search-a-2d-matrix","Medium"),(81,"搜索旋转排序数组 II","search-in-rotated-sorted-array-ii","Medium")]),
+ ("二分查找", 33, [(875,"爱吃香蕉的珂珂","koko-eating-bananas","Medium"),(1011,"在 D 天内送达包裹的能力","capacity-to-ship-packages-within-d-days","Medium")]),
+ ("链表", 206, [(203,"移除链表元素","remove-linked-list-elements","Easy"),(83,"删除排序链表中的重复元素","remove-duplicates-from-sorted-list","Easy")]),
+ ("链表", 21, [(234,"回文链表","palindrome-linked-list","Easy"),(160,"相交链表","intersection-of-two-linked-lists","Easy")]),
+ ("链表", 141, [(142,"环形链表 II","linked-list-cycle-ii","Medium"),(287,"寻找重复数","find-the-duplicate-number","Medium")]),
+ ("链表", 876, [(19,"删除链表的倒数第 N 个结点","remove-nth-node-from-end-of-list","Medium"),(148,"排序链表","sort-list","Medium")]),
+ ("栈与队列", 20, [(682,"棒球比赛","baseball-game","Easy"),(844,"比较含退格的字符串","backspace-string-compare","Easy")]),
+ ("栈与队列", 155, [(496,"下一个更大元素 I","next-greater-element-i","Easy"),(503,"下一个更大元素 II","next-greater-element-ii","Medium")]),
+ ("栈与队列", 232, [(150,"逆波兰表达式求值","evaluate-reverse-polish-notation","Medium"),(71,"简化路径","simplify-path","Medium")]),
+ ("栈与队列", 225, [(622,"设计循环队列","design-circular-queue","Medium"),(641,"设计循环双端队列","design-circular-deque","Medium")]),
+ ("栈与队列", 739, [(901,"股票价格跨度","online-stock-span","Medium"),(856,"括号的分数","score-of-parentheses","Medium")]),
+ ("栈与队列", 42, [(84,"柱状图中最大的矩形","largest-rectangle-in-histogram","Hard"),(85,"最大矩形","maximal-rectangle","Hard")]),
+ ("二叉树DFS", 144, [(100,"相同的树","same-tree","Easy"),(572,"另一棵树的子树","subtree-of-another-tree","Easy")]),
+ ("二叉树DFS", 94, [(257,"二叉树的所有路径","binary-tree-paths","Easy"),(111,"二叉树的最小深度","minimum-depth-of-binary-tree","Easy")]),
+ ("二叉树DFS", 104, [(108,"将有序数组转换为二叉搜索树","convert-sorted-array-to-binary-search-tree","Easy"),(559,"N 叉树的最大深度","maximum-depth-of-n-ary-tree","Easy")]),
+ ("二叉树DFS", 226, [(617,"合并二叉树","merge-two-binary-trees","Easy"),(404,"左叶子之和","sum-of-left-leaves","Easy")]),
+ ("二叉树DFS", 101, [(222,"完全二叉树的节点个数","count-complete-tree-nodes","Medium"),(671,"二叉树中第二小的节点","second-minimum-node-in-a-binary-tree","Easy")]),
+ ("二叉树DFS", 110, [(563,"二叉树的坡度","binary-tree-tilt","Easy"),(687,"最长同值路径","longest-univalue-path","Medium")]),
+ ("二叉树DFS", 543, [(437,"路径总和 III","path-sum-iii","Medium"),(98,"验证二叉搜索树","validate-binary-search-tree","Medium")]),
+ ("二叉树DFS", 112, [(113,"路径总和 II","path-sum-ii","Medium"),(129,"求根节点到叶节点数字之和","sum-root-to-leaf-numbers","Medium")]),
+ ("二叉树DFS", 236, [(235,"二叉搜索树的最近公共祖先","lowest-common-ancestor-of-a-binary-search-tree","Easy"),(701,"二叉搜索树中的插入操作","insert-into-a-binary-search-tree","Medium")]),
+ ("二叉树DFS", 124, [(297,"二叉树的序列化与反序列化","serialize-and-deserialize-binary-tree","Hard"),(968,"监控二叉树","binary-tree-cameras","Hard")]),
+ ("二叉树BFS", 102, [(637,"二叉树的层平均值","average-of-levels-in-binary-tree","Easy"),(107,"二叉树的层序遍历 II","binary-tree-level-order-traversal-ii","Medium")]),
+ ("图与BFS", 200, [(733,"图像渲染","flood-fill","Easy"),(463,"岛屿的周长","island-perimeter","Easy")]),
+ ("图与BFS", 695, [(130,"被围绕的区域","surrounded-regions","Medium"),(1254,"统计封闭岛屿的数目","number-of-closed-islands","Medium")]),
+ ("图与BFS", 994, [(1162,"地图分析","as-far-from-land-as-possible","Medium"),(542,"01 矩阵","01-matrix","Medium")]),
+ ("图与BFS", 207, [(210,"课程表 II","course-schedule-ii","Medium"),(997,"找到小镇的法官","find-the-town-judge","Easy")]),
+ ("回溯", 78, [(77,"组合","combinations","Medium"),(90,"子集 II","subsets-ii","Medium")]),
+ ("回溯", 46, [(47,"全排列 II","permutations-ii","Medium"),(17,"电话号码的字母组合","letter-combinations-of-a-phone-number","Medium")]),
+ ("回溯", 39, [(22,"括号生成","generate-parentheses","Medium"),(40,"组合总和 II","combination-sum-ii","Medium")]),
+ ("动态规划", 70, [(746,"使用最小花费爬楼梯","min-cost-climbing-stairs","Easy"),(118,"杨辉三角","pascals-triangle","Easy")]),
+ ("动态规划", 53, [(152,"乘积最大子数组","maximum-product-subarray","Medium"),(918,"环形子数组的最大和","maximum-sum-circular-subarray","Medium")]),
+ ("动态规划", 198, [(213,"打家劫舍 II","house-robber-ii","Medium"),(337,"打家劫舍 III","house-robber-iii","Medium")]),
+ ("动态规划", 62, [(63,"不同路径 II","unique-paths-ii","Medium"),(64,"最小路径和","minimum-path-sum","Medium")]),
+ ("动态规划", 1143, [(300,"最长递增子序列","longest-increasing-subsequence","Medium"),(583,"两个字符串的删除操作","delete-operation-for-two-strings","Medium")]),
+ ("动态规划", 322, [(91,"解码方法","decode-ways","Medium"),(279,"完全平方数","perfect-squares","Medium")]),
+]
+QN2I = {q[0]: i for i, q in enumerate(Q)}
+
+# 选做加练池：按主题分组、每关独立一对（顺序与 LC_PLAN 中该主题各关的出现顺序一一对应），
+# 保证每天选做题也不同。状态好就做满 5 题（≈50-60min），做完 3 题即达标
+BONUS = {
+ "双指针": [
+  [(922,"按奇偶排序数组 II","sort-array-by-parity-ii","Easy"),(917,"仅仅反转字母","reverse-only-letters","Easy")],
+  [(925,"长按键入","long-pressed-name","Easy"),(680,"验证回文串 II","valid-palindrome-ii","Easy")],
+  [(849,"到最近的人的最大距离","maximize-distance-to-closest-person","Medium"),(986,"区间列表的交集","interval-list-intersections","Medium")],
+  [(881,"救生艇","boats-to-save-people","Medium"),(611,"有效三角形的个数","valid-triangle-number","Medium")],
+  [(75,"颜色分类","sort-colors","Medium"),(633,"平方数之和","sum-of-square-numbers","Medium")],
+  [(713,"乘积小于 K 的子数组","subarray-product-less-than-k","Medium"),(1099,"小于 K 的两数之和","two-sum-less-than-k","Easy")],
+  [(1498,"满足条件的子序列数目","number-of-subsequences-that-satisfy-the-given-sum-condition","Medium"),(825,"适龄的朋友","friends-of-appropriate-ages","Medium")],
+ ],
+ "滑动窗口": [
+  [(1456,"定长子串中元音的最大数目","maximum-number-of-vowels-in-a-substring-of-given-length","Medium"),(187,"重复的DNA序列","repeated-dna-sequences","Medium")],
+  [(904,"水果成篮","fruit-into-baskets","Medium"),(1004,"最大连续1的个数 III","max-consecutive-ones-iii","Medium")],
+ ],
+ "哈希表": [
+  [(771,"宝石与石头","jewels-and-stones","Easy"),(389,"找不同","find-the-difference","Easy")],
+  [(451,"根据字符出现频率排序","sort-characters-by-frequency","Medium"),(500,"键盘行","keyboard-row","Easy")],
+  [(575,"分糖果","distribute-candies","Easy"),(1207,"独一无二的出现次数","unique-number-of-occurrences","Easy")],
+  [(599,"两个列表的最小索引总和","minimum-index-sum-of-two-lists","Easy"),(748,"最短补全词","shortest-completing-word","Easy")],
+  [(645,"错误的集合","set-mismatch","Easy"),(720,"词典中最长的单词","longest-word-in-dictionary","Medium")],
+  [(692,"前K个高频单词","top-k-frequent-words","Medium"),(525,"连续数组","contiguous-array","Medium")],
+ ],
+ "二分查找": [
+  [(441,"排列硬币","arranging-coins","Easy"),(852,"山脉数组的峰顶索引","peak-index-in-a-mountain-array","Medium")],
+  [(1351,"统计有序矩阵中的负数","count-negative-numbers-in-a-sorted-matrix","Easy"),(2089,"找出数组排序后的目标下标","find-target-indices-after-sorting-array","Easy")],
+  [(154,"寻找旋转排序数组中的最小值 II","find-minimum-in-rotated-sorted-array-ii","Medium"),(540,"有序数组中的单一元素","single-element-in-a-sorted-array","Medium")],
+  [(436,"寻找右区间","find-right-interval","Medium"),(981,"基于时间的键值存储","time-based-key-value-store","Medium")],
+  [(1283,"使结果不超过阈值的最小除数","find-the-smallest-divisor-given-a-threshold","Medium"),(410,"分割数组的最大值","split-array-largest-sum","Hard")],
+ ],
+ "链表": [
+  [(92,"反转链表 II","reverse-linked-list-ii","Medium"),(445,"两数相加 II","add-two-numbers-ii","Medium")],
+  [(2,"两数相加","add-two-numbers","Medium"),(24,"两两交换链表中的节点","swap-nodes-in-pairs","Medium")],
+  [(143,"重排链表","reorder-list","Medium"),(147,"对链表进行插入排序","insertion-sort-list","Medium")],
+  [(61,"旋转链表","rotate-list","Medium"),(86,"分隔链表","partition-list","Medium")],
+ ],
+ "栈与队列": [
+  [(1047,"删除字符串中的所有相邻重复项","remove-all-adjacent-duplicates-in-string","Easy"),(394,"字符串解码","decode-string","Medium")],
+  [(1472,"设计浏览器历史记录","design-browser-history","Medium"),(1381,"设计一个支持增量操作的栈","design-a-stack-with-increment-operation","Medium")],
+  [(341,"扁平化嵌套列表迭代器","flatten-nested-list-iterator","Medium"),(735,"小行星碰撞","asteroid-collision","Medium")],
+  [(1670,"设计前中后队列","design-front-middle-back-queue","Medium"),(933,"最近的请求次数","number-of-recent-calls","Easy")],
+  [(402,"移掉 K 位数字","remove-k-digits","Medium"),(636,"函数的独占时间","exclusive-time-of-functions","Medium")],
+  [(907,"子数组的最小值之和","sum-of-subarray-minimums","Medium"),(1019,"链表中的下一个更大节点","next-greater-node-in-linked-list","Medium")],
+ ],
+ "二叉树DFS": [
+  [(669,"修剪二叉搜索树","trim-a-binary-search-tree","Medium"),(1038,"从二叉搜索树到更大和树","convert-bst-to-greater-tree","Medium")],
+  [(897,"递增顺序搜索树","increasing-order-search-tree","Easy"),(700,"二叉搜索树中的搜索","search-in-a-binary-search-tree","Easy")],
+  [(965,"单值二叉树","univalued-binary-tree","Easy"),(606,"根据二叉树创建字符串","construct-string-from-binary-tree","Medium")],
+  [(938,"二叉搜索树的范围和","range-sum-of-bst","Easy"),(530,"二叉搜索树的最小绝对差","minimum-absolute-difference-in-bst","Easy")],
+  [(958,"二叉树的完全性检验","check-completeness-of-a-binary-tree","Medium"),(513,"找树左下角的值","find-bottom-left-tree-value","Medium")],
+  [(508,"出现次数最多的子树元素和","most-frequent-subtree-sum","Medium"),(623,"在二叉树中增加一行","add-one-row-to-tree","Medium")],
+  [(814,"二叉树剪枝","binary-tree-pruning","Medium"),(979,"在二叉树中分配硬币","distribute-coins-in-binary-tree","Medium")],
+  [(988,"从叶结点开始的最小字符串","smallest-string-starting-from-leaf","Medium"),(1022,"从根到叶的二进制数之和","sum-of-root-to-leaf-binary-numbers","Easy")],
+  [(450,"删除二叉搜索树中的节点","delete-node-in-a-bst","Medium"),(1305,"两棵二叉搜索树中的所有元素","all-elements-in-two-binary-search-trees","Medium")],
+  [(1372,"二叉树中的最长交错路径","longest-zigzag-path-in-a-binary-tree","Medium"),(1373,"二叉搜索子树的最大键值和","maximum-sum-bst-in-binary-tree","Hard")],
+ ],
+ "二叉树BFS": [
+  [(515,"在每个树行中找最大值","find-largest-value-in-each-tree-row","Medium"),(199,"二叉树的右视图","binary-tree-right-side-view","Medium")],
+ ],
+ "图与BFS": [
+  [(841,"钥匙和房间","keys-and-rooms","Medium"),(133,"克隆图","clone-graph","Medium")],
+  [(1091,"二进制矩阵中的最短路径","shortest-path-in-binary-matrix","Medium"),(934,"最短的桥","shortest-bridge","Medium")],
+  [(785,"判断二分图","is-graph-bipartite","Medium"),(1926,"迷宫中离入口最近的出口","nearest-exit-from-entrance-in-maze","Medium")],
+  [(802,"找到最终的安全状态","find-eventual-safe-states","Medium"),(684,"冗余连接","redundant-connection","Medium")],
+ ],
+ "回溯": [
+  [(784,"字母大小写全排列","letter-case-permutation","Medium"),(131,"分割回文串","palindrome-partitioning","Medium")],
+  [(967,"连续差相同的数字","numbers-with-same-consecutive-differences","Medium"),(491,"非递减子序列","non-decreasing-subsequences","Medium")],
+  [(216,"组合总和 III","combination-sum-iii","Medium"),(79,"单词搜索","word-search","Medium")],
+ ],
+ "动态规划": [
+  [(509,"斐波那契数","fibonacci-number","Easy"),(1137,"第 N 个泰波那契数","n-th-tribonacci-number","Easy")],
+  [(1014,"最佳观光组合","best-sightseeing-pair","Medium"),(1186,"删除一次得到子数组最大和","maximum-subarray-sum-with-one-deletion","Medium")],
+  [(740,"删除并获得点数","delete-and-earn","Medium"),(790,"多米诺和托米诺平铺","domino-and-tromino-tiling","Medium")],
+  [(931,"下降路径最小和","minimum-falling-path-sum","Medium"),(576,"出界的路径数","out-of-boundary-paths","Medium")],
+  [(516,"最长回文子序列","longest-palindromic-subsequence","Medium"),(712,"两个字符串的最小ASCII删除和","minimum-ascii-delete-sum-for-two-strings","Medium")],
+  [(377,"组合总和 Ⅳ","combination-sum-iv","Medium"),(96,"不同的二叉搜索树","unique-binary-search-trees","Medium")],
+ ],
 }
 
 # ---------- 周末产出日：周六/周日每日任务后追加"可视化产出"项目 ----------
-# 键 = 技能站名关键词（按顺序取第一个命中）；无命中用 DEFAULT_WEEKEND。
+# 键 = 技能站名关键词（按顺序取第一个命中，命中站名）；无命中用 DEFAULT_WEEKEND。
 # 每个值 = 产出项目对列表，按 ISO 周数轮换（每周六/周日的项目不重复）。
 # 每对 = (周六项目, 周日项目)；字段：(项目名, 产出内容[强制复用已学知识], 成就感交付物[含 {W}=ISO周数])。
 DEFAULT_WEEKEND = (
@@ -238,14 +624,24 @@ WEEKEND_OUTPUT = {
          "乳腺癌数据集上并排画：手写逻辑回归决策边界 / kNN 决策边界 / 混淆矩阵热力图，写 5 行话解释为什么结果不同。复用：S1 手写模型全部代码 + matplotlib。",
          "交付：`learning-notes/产出墙/week{W}_model_compare.png` —— 这是『我能手写机器学习』的最强证据"),
     ),
-    "PyTorch": (
-        ("🎥 模型训练过程可视化",
-         "把 PyTorch 训练循环每 10 步的损失和准确率收集起来，画成动画 GIF；再画 MLP/CNN 在 make_moons/CIFAR10 上的决策边界或特征图。复用：S2 全部手写训练循环 + S1 的 matplotlib 技能。",
-         "交付：`learning-notes/产出墙/week{W}_training_anim.gif` + 标注损失下降的 3 个阶段"),
-        ("🧠 网络结构 & 梯度流图",
-         "用你手写的反向传播推导，把 MLP/CNN 每层的形状变化、梯度大小画成一张结构图（可 draw.io 或 matplotlib），与 autograd 结果对比。复用：手推反向传播 + autograd 实验。",
-         "交付：`learning-notes/产出墙/week{W}_net_arch.png` —— 面试画图题直接用它"),
-    ),
+    "PyTorch": [
+        (
+            ("🎥 模型训练过程可视化",
+             "把 PyTorch 训练循环每 10 步的损失和准确率收集起来，画成动画 GIF；再画 MLP/CNN 在 make_moons/CIFAR10 上的决策边界或特征图。复用：S2 全部手写训练循环 + S1 的 matplotlib 技能。",
+             "交付：`learning-notes/产出墙/week{W}_training_anim.gif` + 标注损失下降的 3 个阶段"),
+            ("🧠 网络结构 & 梯度流图",
+             "用你手写的反向传播推导，把 MLP/CNN 每层的形状变化、梯度大小画成一张结构图（可 draw.io 或 matplotlib），与 autograd 结果对比。复用：手推反向传播 + autograd 实验。",
+             "交付：`learning-notes/产出墙/week{W}_net_arch.png` —— 面试画图题直接用它"),
+        ),
+        (
+            ("🔬 分类混淆矩阵 & 错分样本图鉴",
+             "用真实跑完的验证集预测结果，手写计算混淆矩阵热力图，并挑出置信度最高的 Top-9 错分样本拼成一张图，标注模型为什么认错。复用：S1 手写混淆矩阵 + S2 训练评估循环。",
+             "交付：`learning-notes/产出墙/week{W}_error_gallery.png` + 3 条误差规律分析"),
+            ("📊 消融实验 & 学习率调度对比图",
+             "对比两组真实训练实验（如加/不加 BatchNorm、或不同学习率调度）的训练/验证曲线与最终指标表。复用：S2 卷积/MLP 训练工程。",
+             "交付：`learning-notes/产出墙/week{W}_ablation_compare.png` —— 实验报告核心配图"),
+        ),
+    ],
     "Transformer": (
         ("🔥 Attention 热力图",
          "用小矩阵跑通你手写的注意力，把 Q·K^T / softmax 结果画成热力图；再对 BERT 真实句子可视化 attention。复用：手写 Q/K/V、缩放点积注意力、掩码全部代码。",
@@ -304,9 +700,54 @@ def weekend_project(d, station):
         if key in station:
             pairs = val
             break
-    idx = w % len(pairs)
-    title, body, deliver = pairs[0 if d.weekday() == 5 else 1]
+    # 兼容两种结构：[(sat1, sun1), (sat2, sun2)] 或单对 (sat, sun)
+    if isinstance(pairs, list):
+        pair = pairs[w % len(pairs)]
+    else:
+        pair = pairs
+    title, body, deliver = pair[0 if d.weekday() == 5 else 1]
     return title, body, deliver.format(W=w)
+
+def qmeta_of(qi):
+    """由闯关序号取主练题元数据。"""
+    return Q[QN2I[LC_PLAN[qi % len(LC_PLAN)][1]]]
+
+def lc_entry(qi):
+    return LC_PLAN[qi % len(LC_PLAN)]
+
+# ---------- Python 基础营（暂替算法闯关，9 关走完后自动恢复 LeetCode） ----------
+PY_CAMP_DIR = os.environ.get("PY_CAMP_DIR") or r"D:\GEIST\learning-notes\python_basic"
+
+
+def py_camp_status():
+    """读取 python_basic/check.py 的真实进度（不是自报，是真跑测试）。
+
+    返回 None（目录不可用）或 dict：
+      all_done / done / total / index(当前关0基) / name / title / pending / passed / count
+    """
+    check_py = os.path.join(PY_CAMP_DIR, "check.py")
+    if not os.path.exists(check_py):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("py_basic_check", check_py)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        stages = mod.stage_status()
+    except Exception as e:
+        print("py camp status failed:", e, file=sys.stderr)
+        return None
+    if not stages:
+        return None
+
+    total = len(stages)
+    done = sum(1 for s in stages if s["total"] and s["passed"] == s["total"])
+    cur = next((i for i, s in enumerate(stages)
+                if not (s["total"] and s["passed"] == s["total"])), total - 1)
+    s = stages[cur]
+    return {"all_done": done == total, "done": done, "total": total, "index": cur,
+            "name": s["name"], "title": s["title"], "pending": s["pending"],
+            "passed": s["passed"], "count": s["total"], "error": s["error"],
+            "stages": stages}
 
 # ---------- 自定义计划（LLM 生成 / 手动导入，配置存 plan_config.json） ----------
 CONFIG_FILE = os.path.join(BASE, "plan_config.json")
@@ -428,9 +869,12 @@ def save_state(s):
 # ---------- 工具 ----------
 def stage_of(d):
     iso = d.isoformat()
-    for a,b,*rest in STAGES:
+    last_grad = "—"
+    for a, b, station, main, hand, ai, grad in STAGES:
+        if grad and grad != "同上":
+            last_grad = grad
         if a <= iso <= b:
-            return rest
+            return (station, main, hand, ai, last_grad if grad == "同上" else grad)
     return ("计划外", "按 v3 计划复盘/休整（或提前开始下一阶段准备）", "复习本周手写代码", "—", "—")
 
 def plan_of(d):
@@ -526,15 +970,22 @@ def render_case(case, tags):
         return list_args, expected
     return None
 
-def build_practice(qi, qmeta, d, review=False):
+def build_practice(qi, qmeta, d, review=False, round_no=1):
     num, name, slug, diff, tags, sig, hint, cases = qmeta
-    suffix = f"_r{qi+1}" if review else ""
-    fname = f"{d.strftime('%m-%d')}_lc{num}_{slug}{('_v'+str(suffix)) if review else ''}.py"
+    # 兼容旧版 _v_r{qi+1}.py 文件名，新生成的复习文件统一用 _review.py
+    legacy_fname = f"{d.strftime('%m-%d')}_lc{num}_{slug}_v_r{qi+1}.py"
+    if review and os.path.exists(os.path.join(PRAC_DIR, legacy_fname)):
+        fname = legacy_fname
+    else:
+        fname = f"{d.strftime('%m-%d')}_lc{num}_{slug}{'_review' if review else ''}.py"
     path = os.path.join(PRAC_DIR, fname)
     if os.path.exists(path):
         return path, fname  # 幂等：不覆盖已生成（尤其已手写）的文件
 
-    round_tag = f"第 {suffix} 轮复习" if review else "新题"
+    if review:
+        round_tag = "周日复习重做（关掉提示凭记忆手写）" if d.weekday() == 6 else f"第 {round_no} 轮复习"
+    else:
+        round_tag = f"第 {qi+1}/{len(LC_PLAN)} 关 · 新题"
     L = []
     L.append('"""')
     L.append(f"LeetCode {num}. {name}  [{diff}]  —  {round_tag}")
@@ -559,48 +1010,66 @@ def build_practice(qi, qmeta, d, review=False):
         L.append("        pass")
     L.append("")
     L.append("# ---- 本地测试：看到 AC! 再 commit ----")
-    if "design" in tags or cases is None:
+    if cases is None:
         L.append(DESIGN_TEST_COMMENT.rstrip("\n"))
+    elif "design" in tags:
+        L.append("def test():")
+        for line in cases:
+            L.append("    " + line)
+        L.append('    print("AC!")')
+        L.append("")
+        L.append('if __name__ == "__main__":')
+        L.append("    test()")
     else:
         L.append("def test():")
         L.append("    sol = Solution()")
         test_idx = 0
         for args, expected in cases:
             test_idx += 1
+            method = sig.split('(')[0].split()[-1]
             if "ll" in tags:
-                for i, a in enumerate(args):
-                    L.append(f"    a{i} = build_list({a!r})")
-                if num == 876:
-                    L.append(f"    got = to_list(sol.{sig.split('(')[0].split()[-1]}({', '.join(f'a{i}' for i in range(len(args)))}))")
-                    L.append(f"    assert got == {expected!r}, (got, {expected!r})")
-                elif num == 141:
-                    pass
+                if num == 141:
+                    vals, pos = args
+                    L.append(f"    h{test_idx} = build_list({vals!r})")
+                    if pos >= 0:
+                        L.append(f"    cur = h{test_idx}; cyc = None")
+                        L.append(f"    for idx in range({len(vals)}):")
+                        L.append(f"        if idx == {pos}: cyc = cur")
+                        L.append(f"        if cur.next: cur = cur.next")
+                        L.append(f"    if cur: cur.next = cyc")
+                    L.append(f"    assert sol.{method}(h{test_idx}) == {expected!r}, 'case {test_idx}'")
                 else:
-                    L.append(f"    got = to_list(sol.{sig.split('(')[0].split()[-1]}({', '.join(f'a{i}' for i in range(len(args)))}))")
+                    for i, a in enumerate(args):
+                        L.append(f"    a{i} = build_list({a!r})")
+                    L.append(f"    got = to_list(sol.{method}({', '.join(f'a{i}' for i in range(len(args)))}))")
                     L.append(f"    assert got == {expected!r}, (got, {expected!r})")
             elif "tree" in tags:
                 L.append(f"    t0 = build_tree({args[0]!r})")
                 call_args = ["t0"] + [repr(a) for a in args[1:]]
-                method = sig.split('(')[0].split()[-1]
-                if num in (144, 94):
-                    L.append(f"    assert sol.{method}(t0) == {expected!r}")
-                elif num == 102:
+                if num in (144, 94, 102):
                     L.append(f"    assert sol.{method}(t0) == {expected!r}")
                 elif num == 226:
                     L.append(f"    assert level_order(sol.{method}(t0)) == {expected!r}")
+                elif num == 236:
+                    L.append(f"    got = sol.{method}(t0, t0.left, t0.right)")
+                    L.append(f"    assert got is not None and got.val == {expected!r}")
                 else:
                     L.append(f"    assert sol.{method}({', '.join(call_args)}) == {expected!r}")
             else:
-                # 普通题：参数可能是 list/nested list，元数据里 list 入参包了一层 [..]
-                method = sig.split('(')[0].split()[-1]
                 if "inplace" in tags:
                     L.append(f"    nums = {args[0]!r}")
                     L.append(f"    sol.{method}(nums)")
                     L.append(f"    assert nums == {expected!r}, 'case {test_idx}'")
+                elif "lol_eq" in tags:
+                    rendered = [repr(a) for a in args]
+                    L.append(f"    got = sol.{method}({', '.join(rendered)})")
+                    L.append(f"    assert sorted(sorted(x) for x in got) == sorted(sorted(x) for x in {expected!r}), (got, {expected!r})")
+                elif "set_eq" in tags:
+                    rendered = [repr(a) for a in args]
+                    L.append(f"    got = sol.{method}({', '.join(rendered)})")
+                    L.append(f"    assert sorted(got) == sorted({expected!r}), (got, {expected!r})")
                 else:
-                    rendered = []
-                    for a in args:
-                        rendered.append(repr(a))
+                    rendered = [repr(a) for a in args]
                     L.append(f"    assert sol.{method}({', '.join(rendered)}) == {expected!r}, 'case {test_idx}'")
         L.append('    print("AC!")')
         L.append("")
@@ -611,7 +1080,7 @@ def build_practice(qi, qmeta, d, review=False):
     return path, fname
 
 def pick_question(d, state):
-    """返回 (qmeta, review_bool, qi)。周日做本周复习；一轮刷完进入二刷。"""
+    """返回 (qmeta, review_bool, qi)。按 LC_PLAN 闯关顺序；周日复习；一轮刷完进入二刷。"""
     is_sunday = d.weekday() == 6
     if is_sunday and state["history"]:
         week_ago = (d - timedelta(days=6)).isoformat()
@@ -619,30 +1088,42 @@ def pick_question(d, state):
                 if iso >= week_ago and not h.get("review")]
         if done:
             iso, qi = random.choice(done)
-            return Q[qi % len(Q)], True, qi
+            return qmeta_of(qi), True, qi
     qi = state["q_index"]
-    if qi >= len(Q):
-        qi = qi % len(Q)  # 二刷
+    if qi >= len(LC_PLAN):
+        qi = qi % len(LC_PLAN)  # 二刷
         review = True
     else:
         review = False
-    return Q[qi], review, qi
+    return qmeta_of(qi), review, qi
 
-def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, weekend=None):
+def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, lc=None, weekend=None, py_camp=None, py_all=False, note_path=None):
     iso = d.isoformat()
     wd = WEEKDAYS[d.weekday()]
     num, qname, slug, diff, tags, sig, hint, cases = qmeta
-    round_no = state["q_index"] // len(Q) + 1
-    qtag = "复习重做" if review else f"第 {qi+1}/{len(Q)} 题（第 {round_no} 轮）"
+    round_no = state["q_index"] // len(LC_PLAN) + 1
+    qtag = "复习重做" if review else f"第 {qi+1}/{len(LC_PLAN)} 关（第 {round_no} 轮）"
     is_sunday = d.weekday() == 6
     is_weekend = d.weekday() >= 5
     sql_line = plan.get("extra") or None
     station, main_task = plan["station"], plan["main"]
     hand, ai_help, grad = plan["hand"], plan["ai"], plan["grad"]
+    py_on = bool(py_camp and not py_camp["all_done"]
+                 and d.isoformat() <= state.get("py_camp_end", "9999-12-31"))
+    lc_on = bool(LC_FOCUS and lc and not py_on)
+    sec = 3 if (lc_on or py_on) else 2
+    prac_full = os.path.join(PRAC_DIR, qfname) if qfname else ""
+    ielts_file = latest_ielts_file()
     L = []
     L.append(f"# 今日学习计划 · {iso} {wd}")
     L.append("")
-    L.append(f"**当前技能站：{station}** ｜ 连续打卡：**{state['streak']} 天** ｜ 算法：{qtag}")
+    if py_all:
+        track = f"🐍 Python 基础冲刺（9 关今天全通）"
+    elif py_on:
+        track = f"🐍 Python 基础 第 {py_camp['index']+1}/{py_camp['total']} 关"
+    else:
+        track = qtag
+    L.append(f"**当前技能站：{station}** ｜ 连续打卡：**{state['streak']} 天** ｜ {track}")
     if plan.get("goal"):
         L.append(f" ｜ 🎯 **{plan['goal']}**（Day {plan['day_no']}/{plan['day_total']}）")
     L.append("")
@@ -650,21 +1131,77 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, weekend=None
         L.append("> ⚠️ 有未确认的遗留计划：" + "、".join(carry) +
                  "。完成后双击桌面「✅完成今日计划」一并归档；未确认前不推进新题。")
         L.append("")
-    L.append("## 1. 主任务（45-90 分钟，当天必须有 commit）")
-    L.append(f"- {main_task}")
+    L.append("## 1. 主任务（45-90 分钟，当天必须有 commit；课程/考试周优先保 GPA）")
+    L.append(f"- **本周主线**：{main_task}")
+    if not plan.get("goal"):
+        wf_title, wf_desc = WEEKDAY_FOCUS[d.weekday()]
+        L.append(f"- 📅 **今日推进重点（{wf_title}）**：{wf_desc}")
     L.append(f"- ✍️ **必须手写**：{hand}")
     L.append(f"- 🤖 **可交给 AI**：{ai_help}")
-    L.append(f"- 🎯 本站毕业标准：{grad}")
+    L.append(f"- 🎯 **本站毕业标准**：{grad}")
     L.append("")
-    L.append("## 2. 碎片任务")
-    L.append(f"- [ ] **算法手写 20min**：LeetCode {num}. {qname} [{diff}]（{qtag}）")
-    L.append(f"      练习文件已生成：`{os.path.join(PRAC_DIR, qfname)}` —— 在 VS Code 打开手写，本地跑通看到 AC!（禁止纸上默写）")
-    L.append(f"      题目链接：https://leetcode.cn/problems/{slug}/")
+    if py_on:
+        idx = py_camp["index"]
+        if py_all:
+            L.append("## 2. 🐍 Python 基础关（冲刺日 · 9 关今天全通，约 3-4 小时）")
+            L.append(f"**当前进度 {py_camp['done']}/{py_camp['total']} 关已全过** ｜ 建议每关 20 分钟，"
+                     f"卡住超过 10 分钟先看文件顶部提示，别死磕 ｜ **明日起恢复 LeetCode 闯关**")
+            L.append("")
+            for i, s in enumerate(py_camp["stages"]):
+                if s["total"] and s["passed"] == s["total"]:
+                    mark = f"✅ 已通过 {s['passed']}/{s['total']}"
+                elif s.get("error"):
+                    mark = "⚠️ 文件有语法错误，先修好"
+                else:
+                    mark = f"{s['passed']}/{s['total']}"
+                    if s["pending"]:
+                        mark += f" ｜ 待过：{'、'.join(s['pending'])}"
+                L.append(f"- [ ] **第 {i+1} 关 {s['title']}** — `{s['name']}.py` — {mark}")
+            L.append(f"- [ ] **收官自检**：在 `{PY_CAMP_DIR}` 运行 `python check.py`，9 关全 `[通过]` 才算通关")
+            L.append("")
+        else:
+            L.append("## 2. 🐍 Python 基础关（20-30 分钟 · 暂替算法闯关）")
+            L.append(f"**第 {idx+1}/{py_camp['total']} 关：{py_camp['title']}** ｜ 已完成 {py_camp['done']} 关 ｜ 本关 {py_camp['passed']}/{py_camp['count']} 过")
+            L.append(f"- [ ] **打开文件**：`{PY_CAMP_DIR}\\{py_camp['name']}.py`（VS Code，只改中间的函数体）")
+            if py_camp.get("error"):
+                L.append("- ⚠️ 本关文件当前有语法错误（或改动还没保存），先修好能正常运行再自检")
+            elif py_camp["pending"]:
+                L.append(f"- [ ] **今天要过的函数**：{'、'.join(py_camp['pending'])}")
+            else:
+                L.append("- [ ] **今天重写一遍本关**：把已通过的实现删掉，凭记忆重写（防遗忘）")
+            L.append(f"- [ ] **自检**：终端 `python {py_camp['name']}.py`，全部 [通过] 才算过关")
+            L.append(f"- 进度说明：9 关走完自动恢复 LeetCode 闯关（当前 {py_camp['done']}/{py_camp['total']}）")
+            L.append("")
+    elif lc_on:
+        topic, _, extras = lc
+        L.append("## 2. 算法闯关（30-40 分钟）")
+        L.append(f"**今日主题：{topic}** ｜ {qtag}")
+        L.append(f"- [ ] **主练（手写跑通 AC）**：LeetCode {num}. {qname} [{diff}]")
+        L.append(f"      练习文件已生成：`{prac_full}` —— 在 VS Code 打开手写，本地跑通看到 AC!（禁止纸上默写）")
+        if note_path:
+            L.append(f"      刷题笔记已就绪：`{note_path}` —— 记录第一版思路/卡点/一句话总结（确认归档时自动标 AC 并同步代码）")
+        L.append(f"      题目链接：https://leetcode.cn/problems/{slug}/")
+        ex = "　｜　".join(f"[LC {n}. {t} [{df}]](https://leetcode.cn/problems/{s}/)" for n, t, s, df in extras)
+        L.append(f"- [ ] **举一反三（网页直接做，卡 10 分钟看题解再默写）**：{ex}")
+        pairs = BONUS.get(topic) or []
+        k = sum(1 for e in LC_PLAN[: qi % len(LC_PLAN)] if e[0] == topic)
+        bonus = pairs[k % len(pairs)] if pairs else []
+        if bonus:
+            bx = "　｜　".join(f"[LC {n}. {t} [{df}]](https://leetcode.cn/problems/{s}/)" for n, t, s, df in bonus)
+            L.append(f"- [ ]（选做）**加练**：{bx}")
+        L.append("")
+    L.append(f"## {sec}. 碎片任务")
+    if not lc_on and not py_on:
+        L.append(f"- [ ] **算法手写 20min**：LeetCode {num}. {qname} [{diff}]（{qtag}）")
+        L.append(f"      练习文件已生成：`{prac_full}` —— 在 VS Code 打开手写，本地跑通看到 AC!（禁止纸上默写）")
+        if note_path:
+            L.append(f"      刷题笔记已就绪：`{note_path}` —— 记录思路/卡点/一句话总结（确认时自动标 AC）")
+        L.append(f"      题目链接：https://leetcode.cn/problems/{slug}/")
     if sql_line:
         L.append(f"- [ ] **{sql_line}**")
-    L.append("- [ ] **英语 30min**：GRE 单词 + 英文技术阅读")
+    L.append(f"- [ ] **英语 30min（IELTS + 英文技术阅读）**：雅思同义替换/听读词汇整理（记录至 `{ielts_file}`）+ 1 篇英文技术文档/论文摘要")
     L.append("")
-    next_no = 3
+    next_no = sec + 1
     if is_weekend and weekend:
         w_title, w_body, w_deliver = weekend
         L.append(f"## {next_no}. 🎨 周末产出日（可视化产出 · 用上学过的知识）")
@@ -677,7 +1214,7 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, weekend=None
     if is_sunday:
         L.append(f"## {next_no}. 周日特殊任务")
         L.append("- [ ] **重写日 30min**：把本周 AI 帮写最多的一段核心代码删掉，凭理解重写一遍")
-        L.append("- [ ] **Demo Day 30min**：做一个可展示产出（截图/录屏/GIF），写进 learning-notes/progress.md 产出墙")
+        L.append("- [ ] **Demo Day 30min**：把上面周末产出日的作品录屏/GIF，写进 learning-notes/progress.md 产出墙")
         L.append("- [ ] **概念卡 10min**：复习本周+上周的概念卡")
         L.append("")
         next_no += 1
@@ -687,20 +1224,61 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, weekend=None
     L.append("")
     next_no += 1
     L.append(f"## {next_no}. 完成后（确认归档）")
-    L.append("1. 练习文件本地跑通看到 `AC!`，主任务当天有 commit")
+    if py_all:
+        L.append("1. `python check.py` 显示 9 关全 `[通过]`，主任务当天有 commit")
+    elif py_on:
+        L.append(f"1. 第 {py_camp['index']+1} 关全部 `[通过]`，主任务当天有 commit")
+    else:
+        L.append("1. 练习文件本地跑通看到 `AC!`，主任务当天有 commit")
     L.append("2. **双击桌面「✅完成今日计划」**：本计划自动归档到 GitHub dailyPlan 仓库并删除本地文件，之后才推进新题")
-    L.append("3. 没完成就不点确认：文件保留，明天继续攻克同一题（最小方案：练习文件写 1 行也是进步）")
+    if py_all:
+        L.append("3. 没做完也不影响明天：**明天自动回到 LeetCode 闯关**（今天能做几关就几关，进度已保存在代码里）")
+    else:
+        L.append("3. 没完成就不点确认：文件保留，明天继续攻克同一题（最小方案：练习文件写 1 行也是进步）")
     L.append("")
     L.append(f"---\n_由 gen_daily.py 于 {datetime.now().strftime('%Y-%m-%d %H:%M')} 自动生成_")
     return "\n".join(L)
 
-def main():
+def main(force=False):
     today = date.today()
     state = load_state()
     iso = today.isoformat()
+    args = sys.argv[1:]
+    force_regen = force or any(f in args for f in ("--regen", "--py-all", "--new-goal", "--import-plan", "--builtin"))
 
     # 幂等：同一天重复运行不推进（连续打卡与题号由 --confirm 确认时结算）
     state["last_date"] = iso
+
+    # 今天已确认归档：重启 / 重复触发不得再生成（防止"已完成的任务复活"）
+    # 例外：--py-all 冲刺日或 --regen 需要主动覆盖今天
+    if state["history"].get(iso, {}).get("status") == "done" and not force_regen:
+        print("TODAY_DONE")
+        write_run_result({"result": "today_done", "date": iso})
+        return
+
+    plan_path = os.path.join(REPO_PLANS, f"{iso}.md")
+    dp = os.path.join(desktop_dir(), f"学习计划_{iso}.md")
+
+    # 同一天已生成过且未加 --regen：保持已有计划文件时间戳不变（避免一天内重复触发产生二次 git commit 和二次弹窗）
+    if (not force_regen
+            and iso in state["history"]
+            and state["history"][iso].get("status") == "pending"
+            and os.path.exists(plan_path)):
+        h = state["history"][iso]
+        qi, review = h["qi"], h["review"]
+        qmeta = qmeta_of(qi)
+        round_no = state["q_index"] // len(LC_PLAN) + 1
+        if not h.get("py_stage"):
+            build_practice(qi, qmeta, today, review=review, round_no=round_no)
+        if not os.path.exists(dp):
+            try:
+                with open(plan_path, "r", encoding="utf-8") as rf, open(dp, "w", encoding="utf-8") as wf:
+                    wf.write(rf.read())
+            except Exception as e:
+                print("desktop restore failed:", e, file=sys.stderr)
+        print(f"ALREADY_EXISTS:{iso}")
+        write_run_result({"result": "already_exists", "date": iso, "streak": state["streak"]})
+        return
 
     def pending_dates(today_iso):
         return sorted(d for d, h in state["history"].items()
@@ -710,34 +1288,48 @@ def main():
     if iso in state["history"]:
         h = state["history"][iso]
         qi, review = h["qi"], h["review"]
-        qmeta = Q[qi % len(Q)]
+        qmeta = qmeta_of(qi)
         carry = pending_dates(iso)
+        if force_regen:
+            h["status"] = "pending"
     else:
         pend = pending_dates(iso)
         if pend:
             # 有未确认的遗留计划：不推进新题，继续攻克最早未完成的那题
             h0 = state["history"][pend[0]]
             qi, review = h0["qi"], h0["review"]
-            qmeta = Q[qi % len(Q)]
+            qmeta = qmeta_of(qi)
             carry = pend
         else:
             qmeta, review, qi = pick_question(today, state)
         state["history"][iso] = {"qi": qi, "review": review,
                                  "station": stage_of(today)[0], "status": "pending"}
 
-    path, qfname = build_practice(qi, qmeta, today, review=review)
+    py_camp = py_camp_status()
+    py_all = ("--py-all" in args) and bool(py_camp)
+    if py_all:
+        state["py_camp_end"] = iso   # 冲刺日：从明天起强制恢复 LeetCode，不再看剩余关卡
+    py_on = bool(py_camp and not py_camp["all_done"]
+                 and iso <= state.get("py_camp_end", "9999-12-31"))
+    # 标记该日走的是 Python 基础关：确认归档时不推进 LeetCode 题号（否则会空跳题）
+    state["history"][iso]["py_stage"] = py_camp["name"] if py_on else ""
+    round_no = state["q_index"] // len(LC_PLAN) + 1
+    lc = lc_entry(qi)
+    if py_on:
+        path, qfname, note_path = None, "", None
+    else:
+        path, qfname = build_practice(qi, qmeta, today, review=review, round_no=round_no)
+        note_path = ensure_lc_note(qmeta, lc[0], iso, path)
     plan = plan_of(today)
-    state["history"][iso]["station"] = plan["station"]
     weekend = weekend_project(today, plan["station"]) if today.weekday() >= 5 else None
-    md = build_md(today, plan, qmeta, qi, review, qfname, state, carry=carry, weekend=weekend)
+    state["history"][iso]["station"] = plan["station"]
+    md = build_md(today, plan, qmeta, qi, review, qfname, state, carry=carry, lc=lc, weekend=weekend, py_camp=py_camp, py_all=py_all, note_path=note_path)
 
-    plan_path = os.path.join(REPO_PLANS, f"{iso}.md")
     with open(plan_path, "w", encoding="utf-8") as f:
         f.write(md)
 
     desktop_ok = False
     try:
-        dp = os.path.join(desktop_dir(), f"学习计划_{iso}.md")
         with open(dp, "w", encoding="utf-8") as f:
             f.write(md)
         desktop_ok = True
@@ -751,36 +1343,63 @@ def main():
     qnum, qname = qmeta[0], qmeta[1]
     with open(summary, "w", encoding="utf-8") as f:
         f.write(f"今日计划已生成 | 连续 {state['streak']} 天\n")
-        f.write(f"{plan['station']}：{qnum}.{qname}（{'复习' if review else '新题'}）已就位\n")
+        if py_on:
+            if py_all:
+                f.write(f"{plan['station']}：Python 基础冲刺，9 关今天全通（约 3-4h）\n")
+            else:
+                f.write(f"{plan['station']}：Python 基础第 {py_camp['index']+1}/{py_camp['total']} 关"
+                        f"（{py_camp['title']}）\n")
+        else:
+            f.write(f"{plan['station']}：{qnum}.{qname}（{'复习' if review else '新题'}）已就位\n")
 
     print(f"[OK] {iso} {WEEKDAYS[today.weekday()]} streak={state['streak']}")
     print(f"plan: {plan_path}")
     print(f"practice: {path}")
     print(f"desktop: {desktop_ok}")
+    write_run_result({"result": "ok", "date": iso,
+                      "station": plan["station"], "q": f"{qnum}.{qname}",
+                      "review": review, "streak": state["streak"],
+                      "py_stage": py_camp["name"] if py_on else ""})
 
 # ---------- 确认归档（done.ps1 调用：--confirm）----------
-def confirm():
+def confirm(past_only=False):
+    """past_only=True：仅归档今天之前的未确认计划（生成前的补确认弹窗用），
+    并作废今天已自动生成的"延续计划"，使随后的重新生成按新题号出题。"""
     today = date.today()
     tiso = today.isoformat()
     state = load_state()
     pend = sorted(d for d, h in state["history"].items()
                   if h.get("status", "pending") == "pending")
-    if not pend:
+    arch = [d for d in pend if (d < tiso or not past_only)]
+    if not arch:
+        # 兜底：若今天计划尚未生成（如睡眠唤醒漏跑任务），双击「完成今日计划」自动补生成今日计划
+        if not past_only and tiso not in state["history"]:
+            main(force=True)
+            st2 = load_state()
+            print("GENERATED_TODAY:" + tiso)
+            write_run_result({"result": "generated_today", "date": tiso, "streak": st2.get("streak", 0)})
+            return
         print("NOTHING_PENDING")
+        write_run_result({"result": "nothing_pending"})
         return
-    for iso in pend:
+    for iso in arch:
         src = os.path.join(REPO_PLANS, f"{iso}.md")
         dst_dir = os.path.join(REPO_DONE, iso[:7])
         os.makedirs(dst_dir, exist_ok=True)
         if os.path.exists(src):
             os.replace(src, os.path.join(dst_dir, f"{iso}.md"))
-        state["history"][iso]["status"] = "done"
+        h_entry = state["history"][iso]
+        h_entry["status"] = "done"
+        if not h_entry.get("py_stage"):
+            mark_lc_note_ac(h_entry["qi"], iso, review=bool(h_entry.get("review")))
         p = os.path.join(desktop_dir(), f"学习计划_{iso}.md")
         if os.path.exists(p):
             os.remove(p)
-    # 推进题号：仅按非复习题推进（多个遗留日共用同一题只 +1）
-    new_qi = [state["history"][d]["qi"] for d in pend
-              if not state["history"][d].get("review")]
+    # 推进题号：仅按非复习、且当天真的做了 LeetCode 的日子推进
+    # （Python 基础关暂替期间不推进，避免把没做的题白白跳过）
+    new_qi = [state["history"][d]["qi"] for d in arch
+              if not state["history"][d].get("review")
+              and not state["history"][d].get("py_stage")]
     if new_qi:
         state["q_index"] = max(state["q_index"], max(new_qi) + 1)
     # 连续打卡按确认日结算
@@ -792,9 +1411,14 @@ def confirm():
     else:
         state["streak"] = 1
     state["last_confirm"] = tiso
+    # 今天若已被自动生成为"延续计划"，作废该条目 → 随后的重新生成按推进后的题号出新题
+    if past_only and tiso in state["history"] and state["history"][tiso].get("status") == "pending":
+        del state["history"][tiso]
     save_state(state)
-    print("CONFIRMED:" + ",".join(pend))
+    print("CONFIRMED:" + ",".join(arch))
     print(f"STREAK:{state['streak']}")
+    write_run_result({"result": "confirmed", "dates": arch,
+                      "streak": state["streak"], "past_only": past_only})
 
 # ---------- 自定义计划命令 ----------
 def arg_value(args, name, default=None):
@@ -892,10 +1516,105 @@ def cmd_show_plan():
     llm = llm_cfg(cfg)
     print(f"LLM: {llm['base_url']} / {llm['model']} / key={'已配置' if llm.get('api_key') else '未配置'}")
 
+
+def check_practice():
+    """供 done.ps1 在确认归档前调用：自动检测当前待确认计划的练习 .py 文件是否跑通输出 AC!"""
+    st = load_state()
+    pend = sorted(d for d, h in st["history"].items()
+                  if h.get("status", "pending") == "pending")
+    if not pend:
+        write_run_result({"check": "no_pending"})
+        print("CHECK_STATUS:no_pending")
+        return
+    target_iso = pend[-1]
+    h = st["history"][target_iso]
+    if h.get("py_stage"):
+        write_run_result({"check": "ac", "date": target_iso, "file": h["py_stage"], "q": "Python 基础关"})
+        print("CHECK_STATUS:ac")
+        return
+    qmeta = qmeta_of(h["qi"])
+    num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
+    prac_path, fname = _find_practice_file(target_iso, num, slug)
+    qlabel = f"LC {num}. {qname}"
+    if not os.path.exists(prac_path):
+        write_run_result({"check": "todo", "date": target_iso, "file": fname,
+                          "q": qlabel, "reason": "未找到对应的本地练习文件"})
+        print("CHECK_STATUS:todo")
+        return
+    user_code = _extract_user_code(prac_path)
+    if not user_code:
+        write_run_result({"check": "todo", "date": target_iso, "file": fname,
+                          "q": qlabel, "reason": "练习文件仍是初始 pass 模板，尚未填写手写代码"})
+        print("CHECK_STATUS:todo")
+        return
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", prac_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode == 0 and "AC!" in out:
+            write_run_result({"check": "ac", "date": target_iso, "file": fname, "q": qlabel})
+            print("CHECK_STATUS:ac")
+        else:
+            tail = (err or out or f"退出码 {proc.returncode}").splitlines()[-2:]
+            reason = " | ".join(tail)
+            write_run_result({"check": "fail", "date": target_iso, "file": fname,
+                              "q": qlabel, "reason": reason})
+            print("CHECK_STATUS:fail")
+    except subprocess.TimeoutExpired:
+        write_run_result({"check": "fail", "date": target_iso, "file": fname,
+                          "q": qlabel, "reason": "运行超时（>10s，可能存在死循环）"})
+        print("CHECK_STATUS:fail")
+    except Exception as e:
+        write_run_result({"check": "fail", "date": target_iso, "file": fname,
+                          "q": qlabel, "reason": str(e)})
+        print("CHECK_STATUS:fail")
+
+
+def cmd_stats():
+    """打印当前打卡进度、54 关算法闯关进度条与各主题完成度。"""
+    st = load_state()
+    qi = st.get("q_index", 0)
+    total = len(LC_PLAN)
+    done_in_round = min(qi, total) if qi < total else qi % total
+    round_no = qi // total + 1
+    bar_len = 27
+    filled = int(round(bar_len * done_in_round / total))
+    bar = "█" * filled + "░" * (bar_len - filled)
+    station = stage_of(date.today())[0]
+    print(f"==== 每日学习计划 · 进度统计 ====")
+    print(f"当前技能站: {station}  |  连续打卡: {st.get('streak', 0)} 天  |  总确认天数: {sum(1 for h in st['history'].values() if h.get('status') == 'done')} 天")
+    print(f"算法闯关  : [{bar}] {done_in_round}/{total} 关（第 {round_no} 轮）")
+    topics = {}
+    for i, (tp, qn, _) in enumerate(LC_PLAN):
+        topics.setdefault(tp, [0, 0])
+        topics[tp][1] += 1
+        if i < qi:
+            topics[tp][0] += 1
+    print("各主题进度:")
+    for tp, (d_cnt, t_cnt) in topics.items():
+        mark = "✅" if d_cnt == t_cnt else ("🔥" if d_cnt > 0 else "⏳")
+        print(f"  {mark} {tp:<8}: {d_cnt}/{t_cnt}")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--confirm" in args:
-        confirm()
+    if "--status" in args:
+        # 供 run_daily.ps1 弹窗决策：是否有未确认遗留 / 今天是否已生成过
+        st = load_state()
+        t = date.today().isoformat()
+        pend = sorted(d for d, h in st["history"].items()
+                      if h.get("status", "pending") == "pending" and d < t)
+        print("CARRY:" + (",".join(pend) if pend else "none"))
+        print("TODAY_ENTRY:" + ("yes" if t in st["history"] else "no"))
+    elif "--check-practice" in args:
+        check_practice()
+    elif "--confirm" in args:
+        confirm(past_only="--past-only" in args)
+    elif "--stats" in args:
+        cmd_stats()
     elif "--new-goal" in args:
         cmd_new_goal(args)
     elif "--import-plan" in args:
@@ -905,7 +1624,7 @@ if __name__ == "__main__":
         cfg["mode"] = "builtin"
         save_plan_cfg(cfg)
         print("[OK] 已切回内置计划")
-        main()
+        main(force=True)
     elif "--show-plan" in args:
         cmd_show_plan()
     else:
