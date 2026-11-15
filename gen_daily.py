@@ -1079,16 +1079,106 @@ def build_practice(qi, qmeta, d, review=False, round_no=1):
         f.write("\n".join(L) + "\n")
     return path, fname
 
+def _flagged_review_qnums():
+    """扫描 leetcode practice/README.md 与 notes/*.md，返回标记了『需二刷 / 不会 / 半懂 / 否』的题号集合。"""
+    flagged = set()
+    if not os.path.isdir(LC_NOTES_DIR):
+        return flagged
+    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    if "需二刷" in line and line.strip().startswith("|"):
+                        m = re.match(r"^\|\s*0*(\d+)\s*\|", line.strip())
+                        if m:
+                            flagged.add(int(m.group(1)))
+        except Exception:
+            pass
+    notes_sub = os.path.join(LC_NOTES_DIR, "notes")
+    if os.path.isdir(notes_sub):
+        for fn in os.listdir(notes_sub):
+            if not fn.endswith(".md"):
+                continue
+            m = re.match(r"^0*(\d+)-", fn)
+            if not m:
+                continue
+            qnum = int(m.group(1))
+            try:
+                with open(os.path.join(notes_sub, fn), "r", encoding="utf-8-sig") as f:
+                    txt = f.read()
+                if re.search(r"^- 状态：\s*需二刷", txt, flags=re.MULTILINE):
+                    flagged.add(qnum)
+                if re.search(r"^- 是否能不看答案写出来：\s*(否|不会|半懂|不能)", txt, flags=re.MULTILINE):
+                    flagged.add(qnum)
+            except Exception:
+                pass
+    return flagged
+
+
 def pick_question(d, state):
-    """返回 (qmeta, review_bool, qi)。按 LC_PLAN 闯关顺序；周日复习；一轮刷完进入二刷。"""
+    """返回 (qmeta, review_bool, qi)。
+    周日智能抽题优先级：
+      1) 刷题笔记中标记为『需二刷 / 不会 / 半懂』的已学题（优先攻克薄弱项）
+      2) 本周（近6天）新做且未复习过的 Medium/Hard 题
+      3) 本周新做且未复习过的其他题
+      4) 7~21天前做过且从未周日复习过的 Medium/Hard 题（艾宾浩斯间隔回顾）
+    """
     is_sunday = d.weekday() == 6
     if is_sunday and state["history"]:
+        today_iso = d.isoformat()
         week_ago = (d - timedelta(days=6)).isoformat()
-        done = [(iso, h["qi"]) for iso, h in state["history"].items()
-                if iso >= week_ago and not h.get("review")]
-        if done:
-            iso, qi = random.choice(done)
+        three_weeks_ago = (d - timedelta(days=21)).isoformat()
+        two_weeks_ago = (d - timedelta(days=14)).isoformat()
+
+        recent_reviewed = {
+            h["qi"] for iso, h in state["history"].items()
+            if iso < today_iso and iso >= two_weeks_ago and h.get("review")
+        }
+        all_reviewed = {
+            h["qi"] for iso, h in state["history"].items()
+            if iso < today_iso and h.get("review")
+        }
+        done_all = [
+            (iso, h["qi"]) for iso, h in sorted(state["history"].items())
+            if iso < today_iso and not h.get("review") and not h.get("py_stage")
+        ]
+
+        # 1) 优先抽标记了「需二刷 / 不会 / 半懂」的题
+        flagged_nums = _flagged_review_qnums()
+        if flagged_nums:
+            flagged_qis = [
+                qi for _, qi in done_all
+                if qmeta_of(qi)[0] in flagged_nums and qi not in recent_reviewed
+            ]
+            if flagged_qis:
+                qi = flagged_qis[0]
+                return qmeta_of(qi), True, qi
+
+        # 2) 本周新题：优先选尚未复习过的 Medium / Hard
+        week_done = [
+            qi for iso, qi in done_all
+            if iso >= week_ago and qi not in recent_reviewed
+        ]
+        if week_done:
+            mh = [qi for qi in week_done if qmeta_of(qi)[3] in ("Hard", "Medium") and qi not in all_reviewed]
+            if mh:
+                qi = random.choice(mh)
+                return qmeta_of(qi), True, qi
+            unrev = [qi for qi in week_done if qi not in all_reviewed]
+            qi = random.choice(unrev if unrev else week_done)
             return qmeta_of(qi), True, qi
+
+        # 3) 艾宾浩斯 7~21 天间隔复习
+        older_done = [
+            qi for iso, qi in done_all
+            if three_weeks_ago <= iso < week_ago and qi not in all_reviewed
+        ]
+        if older_done:
+            mh_old = [qi for qi in older_done if qmeta_of(qi)[3] in ("Hard", "Medium")]
+            qi = random.choice(mh_old if mh_old else older_done)
+            return qmeta_of(qi), True, qi
+
     qi = state["q_index"]
     if qi >= len(LC_PLAN):
         qi = qi % len(LC_PLAN)  # 二刷
@@ -1224,13 +1314,14 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, lc=None, wee
     L.append("")
     next_no += 1
     L.append(f"## {next_no}. 完成后（确认归档）")
+    L.append("0. **一键开启工作台**：双击桌面「🚀开始今日学习」（或运行 `python gen_daily.py --open`），自动用 VS Code 打开本计划 + 练习 `.py` + 刷题笔记并打开网页题目")
     if py_all:
         L.append("1. `python check.py` 显示 9 关全 `[通过]`，主任务当天有 commit")
     elif py_on:
         L.append(f"1. 第 {py_camp['index']+1} 关全部 `[通过]`，主任务当天有 commit")
     else:
         L.append("1. 练习文件本地跑通看到 `AC!`，主任务当天有 commit")
-    L.append("2. **双击桌面「✅完成今日计划」**：本计划自动归档到 GitHub dailyPlan 仓库并删除本地文件，之后才推进新题")
+    L.append("2. **双击桌面「✅完成今日计划」**：自动验证本地 `AC!` → 勾选完成项并汇总今日各仓库 Git Commits → 归档至 `dailyPlan` 仓库并推进新题")
     if py_all:
         L.append("3. 没做完也不影响明天：**明天自动回到 LeetCode 闯关**（今天能做几关就几关，进度已保存在代码里）")
     else:
@@ -1361,6 +1452,101 @@ def main(force=False):
                       "review": review, "streak": state["streak"],
                       "py_stage": py_camp["name"] if py_on else ""})
 
+def _collect_git_commits(iso):
+    """扫描 WORKSPACE_ROOT 下各独立 Git 仓库（不含 dailyPlan 归档仓库自身）在指定日期 iso 产生的提交。"""
+    commits = []
+    if not os.path.isdir(WORKSPACE_ROOT):
+        return commits
+    for name in sorted(os.listdir(WORKSPACE_ROOT)):
+        if name == "dailyPlan":
+            continue
+        repo_dir = os.path.join(WORKSPACE_ROOT, name)
+        if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    "git", "-C", repo_dir, "log",
+                    f"--since={iso} 00:00:00",
+                    f"--until={iso} 23:59:59",
+                    "--pretty=format:%h %s",
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                for line in proc.stdout.strip().splitlines():
+                    commits.append((name, line.strip()))
+        except Exception:
+            pass
+    return commits
+
+
+def _practice_ac_status_for_date(iso, h_entry):
+    """检测某日练习文件是否已本地跑通 AC!，返回简短状态文案。"""
+    if h_entry.get("py_stage"):
+        return f"🐍 Python 基础关（{h_entry['py_stage']}）已确认"
+    qmeta = qmeta_of(h_entry["qi"])
+    num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
+    prac_path, fname = _find_practice_file(iso, num, slug)
+    if not os.path.exists(prac_path) or not _extract_user_code(prac_path):
+        return f"☑️ 已确认完成（`{fname}` 为网页端完成或未写本地代码）"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", prac_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8
+        )
+        if proc.returncode == 0 and "AC!" in (proc.stdout or ""):
+            return f"✅ 本地代码已跑通 `AC!`（`{fname}`）"
+        return f"☑️ 已确认完成（`{fname}` 本地代码已编写）"
+    except Exception:
+        return f"☑️ 已确认完成（`{fname}`）"
+
+
+def _finalize_archived_md(iso, dst_path, streak, h_entry):
+    """归档时自动将任务复选框打勾 [x]，并追加『📊 今日完成结算记录』（含当日各仓库 Git 提交汇总）。"""
+    if not os.path.exists(dst_path):
+        return
+    try:
+        with open(dst_path, "r", encoding="utf-8-sig") as f:
+            content = f.read()
+        # 自动勾选所有必做任务复选框（保留「（选做）」原样）
+        out_lines = []
+        for line in content.splitlines():
+            if line.startswith("- [ ] ") and not line.startswith("- [ ]（选做）"):
+                out_lines.append("- [x] " + line[6:])
+            else:
+                out_lines.append(line)
+        updated = "\n".join(out_lines)
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        prac_status = _practice_ac_status_for_date(iso, h_entry)
+        commits = _collect_git_commits(iso)
+        rec = [
+            "## 📊 今日完成结算记录",
+            f"- **确认归档时间**：{now_str}",
+            f"- **连续打卡**：{streak} 天",
+            f"- **练习自检状态**：{prac_status}",
+        ]
+        if commits:
+            rec.append(f"- **当日 Git 提交汇总（共 {len(commits)} 条）**：")
+            for repo_name, c_line in commits[:15]:
+                rec.append(f"  - `{repo_name}`：`{c_line}`")
+        else:
+            rec.append("- **当日 Git 提交汇总**：（当日无其他本地仓库提交记录）")
+        rec_block = "\n".join(rec) + "\n\n"
+
+        if "## 📊 今日完成结算记录" not in updated:
+            sep_idx = updated.rfind("\n---\n")
+            if sep_idx >= 0:
+                updated = updated[:sep_idx + 1] + rec_block + updated[sep_idx + 1:]
+            else:
+                updated = updated.rstrip() + "\n\n" + rec_block
+        with open(dst_path, "w", encoding="utf-8") as f:
+            f.write(updated)
+    except Exception as e:
+        print("finalize archived md failed:", e, file=sys.stderr)
+
+
 # ---------- 确认归档（done.ps1 调用：--confirm）----------
 def confirm(past_only=False):
     """past_only=True：仅归档今天之前的未确认计划（生成前的补确认弹窗用），
@@ -1382,14 +1568,25 @@ def confirm(past_only=False):
         print("NOTHING_PENDING")
         write_run_result({"result": "nothing_pending"})
         return
+    # 先计算本次确认后的最新 streak，以便写入归档结算记录
+    last = state.get("last_confirm")
+    if last == tiso:
+        new_streak = state.get("streak", 1)
+    elif last == (today - timedelta(days=1)).isoformat():
+        new_streak = state.get("streak", 0) + 1
+    else:
+        new_streak = 1
+
     for iso in arch:
         src = os.path.join(REPO_PLANS, f"{iso}.md")
         dst_dir = os.path.join(REPO_DONE, iso[:7])
         os.makedirs(dst_dir, exist_ok=True)
+        dst_path = os.path.join(dst_dir, f"{iso}.md")
         if os.path.exists(src):
-            os.replace(src, os.path.join(dst_dir, f"{iso}.md"))
+            os.replace(src, dst_path)
         h_entry = state["history"][iso]
         h_entry["status"] = "done"
+        _finalize_archived_md(iso, dst_path, new_streak, h_entry)
         if not h_entry.get("py_stage"):
             mark_lc_note_ac(h_entry["qi"], iso, review=bool(h_entry.get("review")))
         p = os.path.join(desktop_dir(), f"学习计划_{iso}.md")
@@ -1402,14 +1599,7 @@ def confirm(past_only=False):
               and not state["history"][d].get("py_stage")]
     if new_qi:
         state["q_index"] = max(state["q_index"], max(new_qi) + 1)
-    # 连续打卡按确认日结算
-    last = state.get("last_confirm")
-    if last == tiso:
-        pass
-    elif last == (today - timedelta(days=1)).isoformat():
-        state["streak"] = state.get("streak", 0) + 1
-    else:
-        state["streak"] = 1
+    state["streak"] = new_streak
     state["last_confirm"] = tiso
     # 今天若已被自动生成为"延续计划"，作废该条目 → 随后的重新生成按推进后的题号出新题
     if past_only and tiso in state["history"] and state["history"][tiso].get("status") == "pending":
@@ -1599,6 +1789,165 @@ def cmd_stats():
         print(f"  {mark} {tp:<8}: {d_cnt}/{t_cnt}")
 
 
+def sync_notes_history():
+    """将 state.json 中历史已刷过的所有题目回填到 learning-notes/leetcode practice/ 的笔记库与 README 进度表。"""
+    if not os.path.isdir(LC_NOTES_DIR):
+        print("未找到 leetcode practice 目录")
+        return
+    st = load_state()
+    first_date = {}
+    first_prac = {}
+    review_date = {}
+    done_qis = set()
+    seen_qis = []
+
+    for iso, h in sorted(st["history"].items()):
+        qi = h["qi"]
+        qmeta = qmeta_of(qi)
+        num, slug = qmeta[0], qmeta[2]
+        p_path, _ = _find_practice_file(iso, num, slug)
+        if qi not in first_date:
+            first_date[qi] = iso
+            first_prac[qi] = p_path
+            seen_qis.append(qi)
+        if h.get("review") and h.get("status") == "done":
+            review_date[qi] = iso
+        if h.get("status") == "done":
+            done_qis.add(qi)
+
+    flagged = _flagged_review_qnums()
+    rows = []
+    for qi in sorted(set(seen_qis)):
+        qmeta = qmeta_of(qi)
+        topic = lc_entry(qi)[0]
+        num, qname, slug, diff = qmeta[0], qmeta[1], qmeta[2], qmeta[3]
+        diff_zh = DIFF_ZH.get(diff, diff)
+        iso = first_date[qi]
+        prac_path = first_prac[qi]
+        note_path = ensure_lc_note(qmeta, topic, iso, prac_path)
+
+        status_str = "需二刷" if num in flagged else ("AC" if qi in done_qis else "进行中")
+        if note_path and os.path.exists(note_path):
+            try:
+                with open(note_path, "r", encoding="utf-8-sig") as f:
+                    nt = f.read()
+                nt = re.sub(r"^- 状态：.*$", f"- 状态：{status_str}", nt, flags=re.MULTILINE)
+                if qi in review_date:
+                    nt = re.sub(
+                        r"^- 第一次重做：还没做\s*$",
+                        f"- 第一次重做：{review_date[qi]} 已周日复习",
+                        nt,
+                        flags=re.MULTILINE,
+                    )
+                with open(note_path, "w", encoding="utf-8") as f:
+                    f.write(nt)
+            except Exception:
+                pass
+        note_fname = f"{num:04d}-{qname}.md"
+        rows.append(f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | {status_str} | {iso} |")
+
+    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
+    if os.path.exists(readme_path) and rows:
+        with open(readme_path, "r", encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+        new_lines = []
+        in_table = False
+        table_replaced = False
+        for line in lines:
+            if line.strip().startswith("|---"):
+                in_table = True
+                new_lines.append(line)
+                new_lines.extend(rows)
+                table_replaced = True
+                continue
+            if in_table:
+                if line.strip().startswith("|"):
+                    continue
+                else:
+                    in_table = False
+            new_lines.append(line)
+        if table_replaced:
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(new_lines) + "\n")
+    print(f"[OK] 已同步 {len(rows)} 道历史题目至 {LC_NOTES_DIR}")
+
+
+def cmd_mark_review(args):
+    """将指定题号标记为『需二刷』（下个周日智能复习优先抽取）。用法: python gen_daily.py --mark-review 739"""
+    val = arg_value(args, "--mark-review")
+    if not val or not val.isdigit():
+        print("用法: python gen_daily.py --mark-review <题号，如 739>")
+        sys.exit(2)
+    target_num = int(val)
+    if target_num not in QN2I:
+        print(f"题库中未找到题号 {target_num}")
+        sys.exit(2)
+    qmeta = Q[QN2I[target_num]]
+    qname = qmeta[1]
+    note_fname = f"{target_num:04d}-{qname}.md"
+    note_path = os.path.join(LC_NOTES_DIR, "notes", note_fname)
+    if os.path.exists(note_path):
+        with open(note_path, "r", encoding="utf-8-sig") as f:
+            nt = f.read()
+        nt = re.sub(r"^- 状态：.*$", "- 状态：需二刷", nt, flags=re.MULTILINE)
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write(nt)
+    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
+    if os.path.exists(readme_path):
+        with open(readme_path, "r", encoding="utf-8-sig") as f:
+            rc = f.read()
+        pattern = rf"^(\|\s*{target_num:04d}\s*\|[^|]+\|[^|]+\|[^|]+\|\s*)(?:进行中|未开始|AC)(\s*\|[^|]+\|)$"
+        rc_new = re.sub(pattern, r"\1需二刷\2", rc, flags=re.MULTILINE)
+        if rc_new != rc:
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(rc_new)
+    print(f"[OK] 已将 LC {target_num}. {qname} 标记为『需二刷』，下个周日将优先抽考！")
+
+
+def cmd_open():
+    """一键开启今日学习工作台：若今日未生成先生成 → VS Code 同时打开计划/练习.py/刷题笔记 → 浏览器打开题目页。"""
+    import webbrowser
+    tiso = date.today().isoformat()
+    st = load_state()
+    if tiso not in st["history"]:
+        main(force=True)
+        st = load_state()
+    h = st["history"].get(tiso) or {}
+    qi = h.get("qi", st.get("q_index", 0))
+    qmeta = qmeta_of(qi)
+    topic = lc_entry(qi)[0]
+    num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
+    prac_path, _ = _find_practice_file(tiso, num, slug)
+    note_path = ensure_lc_note(qmeta, topic, tiso, prac_path)
+    dp = os.path.join(desktop_dir(), f"学习计划_{tiso}.md")
+    plan_file = dp if os.path.exists(dp) else os.path.join(REPO_PLANS, f"{tiso}.md")
+    if not os.path.exists(plan_file):
+        done_file = os.path.join(REPO_DONE, tiso[:7], f"{tiso}.md")
+        if os.path.exists(done_file):
+            plan_file = done_file
+
+    files_to_open = [p for p in (plan_file, prac_path, note_path) if p and os.path.exists(p)]
+    code_candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Microsoft VS Code", "Code.exe"),
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+        "code",
+    ]
+    code_exe = next((c for c in code_candidates if c == "code" or os.path.exists(c)), "code")
+    try:
+        subprocess.Popen([code_exe] + files_to_open, shell=(code_exe == "code"))
+    except Exception as e:
+        print("open vscode failed:", e, file=sys.stderr)
+
+    url = f"https://leetcode.cn/problems/{slug}/"
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        print("open browser failed:", e, file=sys.stderr)
+
+    write_run_result({"result": "opened", "date": tiso, "q": f"LC {num}. {qname}", "files": files_to_open, "url": url})
+    print(f"[OPENED] {tiso} LC {num}. {qname}")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--status" in args:
@@ -1613,6 +1962,12 @@ if __name__ == "__main__":
         check_practice()
     elif "--confirm" in args:
         confirm(past_only="--past-only" in args)
+    elif "--sync-notes" in args:
+        sync_notes_history()
+    elif "--mark-review" in args:
+        cmd_mark_review(args)
+    elif "--open" in args:
+        cmd_open()
     elif "--stats" in args:
         cmd_stats()
     elif "--new-goal" in args:
