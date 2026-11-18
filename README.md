@@ -54,6 +54,20 @@ dailyPlan/
 └── practice/       # 每日手写练习 .py 骨架（跑通输出 AC!）
 ```
 
+## Obsidian 知识库同步（可选）
+
+如果同级目录存在 `obsidian-notes/`（带 `.obsidian`），脚本会把内容自动镜像一份进去，方便在 Obsidian 里用 Dataview 看历史：
+
+| 位置 | 内容 |
+|---|---|
+| `10-学习计划/daily/plans/` | 今日计划（带 `skill_station` / `leetcode` / `review` frontmatter） |
+| `10-学习计划/daily/done/YYYY-MM/` | 已归档计划（frontmatter 里 `status: 完成`） |
+| `10-学习计划/daily/practice/` | 手写练习 `.py` 副本 |
+| `03-数据结构与算法/leetcode practice/notes/` | 刷题笔记（YAML frontmatter，`status: AC / 需二刷`，Dataview 自动汇总） |
+| `08-英语/IELTS/` | 英语周记镜像 |
+
+镜像只作备份与阅读，**真正运行的仍是本目录的脚本**；`--sync-obsidian` 可手动全量补同步，`run_daily.ps1` / `done.ps1` 也会在生成与归档后自动推送 Obsidian 库。
+
 ## 快速开始
 
 ```powershell
@@ -112,10 +126,10 @@ python gen_daily.py --import-plan my_plan.json --goal "我的目标"
 
 | 文件 | 作用 |
 |---|---|
-| `gen_daily.py` | 计划生成器（纯标准库）。内置技能站时间表 `STAGES`（含周内节奏拆解）、54 关 LeetCode 主题闯关 `LC_PLAN`（主练 + 举一反三 + 选做加练池 `BONUS` + 智能周日薄弱项抽考），自动生成计划 md + 全题库可运行 `test()` 练习骨架 + 自动联动 `leetcode practice` 笔记库；支持 `--open`、`--confirm`、`--check-practice`、`--sync-notes`、`--mark-review`、`--stats`、`--regen` |
+| `gen_daily.py` | 计划生成器（纯标准库）。内置技能站时间表 `STAGES`（含周内节奏拆解）、54 关 LeetCode 主题闯关 `LC_PLAN`（主练 + 举一反三 + 选做加练池 `BONUS` + 智能周日薄弱项抽考），自动生成计划 md + 全题库可运行 `test()` 练习骨架 + 自动联动 `leetcode practice` 笔记库（learning-notes 与 Obsidian 双库）；支持 `--open`、`--confirm`、`--check-practice`、`--sync-notes`、`--sync-obsidian`、`--mark-review`、`--stats`、`--regen` |
 | `open_daily.ps1` | 桌面「🚀开始今日学习.vbs」入口调用：一键用 VS Code 同时打开今日计划、练习 `.py`、对应刷题笔记，并自动在浏览器打开题目页 |
-| `run_daily.ps1` | 登录/08:30（含白天每2h轻量巡检兜底）触发：昨日遗留补确认弹窗 → 生成 → 首次 Toast 通知 → 推送 dailyPlan 仓库（含未推送提交自动补推） |
-| `done.ps1` | 桌面确认入口调用：`--check-practice` 本地代码 `AC!` 自检（未过弹窗确认）→ `--confirm` 自动勾选完成项 `[x]`、汇总当日各仓库 Git Commits、刷题笔记自动标 `AC` → git 归档推送 → Toast 反馈；若当日计划漏生成则双击自动补生成 |
+| `run_daily.ps1` | 登录/08:30（含白天每2h轻量巡检兜底）触发：昨日遗留补确认弹窗 → 生成 → 首次 Toast 通知 → 推送 dailyPlan 与 obsidian-notes 两个仓库 |
+| `done.ps1` | 桌面确认入口调用：`--check-practice` 本地代码 `AC!` 自检（未过弹窗确认）→ `--confirm` 自动勾选完成项 `[x]`、汇总当日各仓库 Git Commits、刷题笔记自动标 `AC` → git 归档推送（含 Obsidian 库）→ Toast 反馈；若当日计划漏生成则双击自动补生成 |
 | `commit_evening.ps1` | 23:00 晚间触发：若当日计划未确认则弹 Toast 提醒，并自动备份 `dailyPlan/practice/` 手写进度 |
 | `install_task.ps1` | 基于 `Register-ScheduledTask` 一键注册 3 个计划任务（支持电池模式启动 + 睡眠唤醒错时自动补跑 `StartWhenAvailable`） |
 

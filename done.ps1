@@ -9,6 +9,9 @@ if (-not (Test-Path $py)) { $py = "py" }
 $p1 = Split-Path $dir -Parent
 $p2 = Split-Path $p1 -Parent
 $repo = if (Test-Path (Join-Path $p1 "dailyPlan\.git")) { Join-Path $p1 "dailyPlan" } else { Join-Path $p2 "dailyPlan" }
+# Obsidian 库：在 dailyPlan 同级找 obsidian-notes/.obsidian
+$vault = Join-Path (Split-Path $repo -Parent) "obsidian-notes"
+if (-not (Test-Path (Join-Path $vault ".obsidian"))) { $vault = $null }
 $stamp = Get-Date -Format "yyyy-MM-dd"
 if (-not (Test-Path (Join-Path $dir "logs"))) { New-Item -ItemType Directory -Path (Join-Path $dir "logs") | Out-Null }
 $log = Join-Path $dir "logs\$stamp.log"
@@ -133,6 +136,24 @@ if ($l1) {
     }
     if ($pushed) { $l2 = "${acTag}已推送 GitHub dailyPlan ｜ 连续打卡 $streak 天" }
     else { $l2 = "${acTag}本地已归档（推送失败，下次自动补推）｜ 连续打卡 $streak 天" }
+
+    # 同步推送 Obsidian 库（归档计划、AC 笔记与代码回写都在里面）
+    if ($vault) {
+        try {
+            if (Test-Path (Join-Path $vault ".git")) {
+                Push-Location $vault
+                git add -A
+                $vMsg = git commit -m "daily: archive $($dates -join ' ')" 2>&1 | Out-String
+                Write-Log $vMsg.Trim()
+                $vPush = git push origin main 2>&1 | Out-String
+                Write-Log $vPush.Trim()
+                Pop-Location
+            }
+        } catch {
+            Write-Log "obsidian git failed: $_"
+            try { Pop-Location } catch {}
+        }
+    }
 } else {
     $l1 = "确认失败，详见日志"
     $l2 = "logs\$stamp.log"

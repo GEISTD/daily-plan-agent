@@ -9,6 +9,9 @@ if (-not (Test-Path $py)) { $py = "py" }
 $p1 = Split-Path $dir -Parent
 $p2 = Split-Path $p1 -Parent
 $repo = if (Test-Path (Join-Path $p1 "dailyPlan\.git")) { Join-Path $p1 "dailyPlan" } else { Join-Path $p2 "dailyPlan" }
+# Obsidian 库：在 dailyPlan 同级找 obsidian-notes/.obsidian
+$vault = Join-Path (Split-Path $repo -Parent) "obsidian-notes"
+if (-not (Test-Path (Join-Path $vault ".obsidian"))) { $vault = $null }
 
 $mtx = New-Object System.Threading.Mutex($false, "Local\AIPlanDailyRun")
 if (-not $mtx.WaitOne(5000)) { exit }
@@ -93,6 +96,31 @@ try {
     } catch {
         Write-Log "git failed: $_"
         try { Pop-Location } catch {}
+    }
+
+    # 4) 同步推送 Obsidian 库（计划/练习/笔记镜像都在里面）
+    if ($vault) {
+        try {
+            if (Test-Path (Join-Path $vault ".git")) {
+                Push-Location $vault
+                $vDirty = git status --porcelain
+                if ($vDirty) {
+                    git add -A
+                    $vMsg = git commit -m "daily: sync plan $stamp" 2>&1 | Out-String
+                    Write-Log $vMsg.Trim()
+                }
+                $vUnpushed = 0
+                try { $vUnpushed = [int](git rev-list --count origin/main..HEAD 2>$null) } catch { $vUnpushed = 0 }
+                if ($vDirty -or $vUnpushed -gt 0) {
+                    $vPush = git push origin main 2>&1 | Out-String
+                    Write-Log $vPush.Trim()
+                }
+                Pop-Location
+            }
+        } catch {
+           Write-Log "obsidian git failed: $_"
+            try { Pop-Location } catch {}
+        }
     }
 }
 finally {

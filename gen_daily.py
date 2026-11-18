@@ -8,7 +8,7 @@
 - 自定义计划：--new-goal "目标" 调用 LLM 生成逐日计划；--import-plan 导入现成 JSON；--builtin 切回内置
 纯标准库，无第三方依赖。
 """
-import importlib.util, json, os, random, re, subprocess, sys
+import importlib.util, json, os, random, re, shutil, subprocess, sys
 from datetime import date, datetime, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -23,32 +23,58 @@ def write_run_result(obj):
         json.dump(obj, f, ensure_ascii=False)
 
 
+def _write_lf(path, text):
+    """写文本并强制 LF 换行：Obsidian 库的 .gitattributes 是 `* text=auto eol=lf`，
+    用默认 CRLF 写会让每次同步都产生一整片假的 diff。"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def _find_workspace_root():
+    # 向上逐级查找：认准含 .git 的独立归档仓库 dailyPlan，或含 obsidian-notes/.obsidian 的库根，
+    # 这样脚本无论是从 learning-notes/daily 还是从 obsidian-notes/10-学习计划/daily 运行都能定位到同一工作区。
+    cur = BASE
+    for _ in range(5):
+        cur = os.path.dirname(cur)
+        if not cur or os.path.dirname(cur) == cur:
+            break
+        if os.path.isdir(os.path.join(cur, "dailyPlan", ".git")):
+            return cur
+        if (os.path.isdir(os.path.join(cur, "obsidian-notes", ".obsidian"))
+                and os.path.isdir(os.path.join(cur, "learning-notes"))):
+            return cur
     p1 = os.path.dirname(BASE)
     p2 = os.path.dirname(p1)
-    # 认准含 .git 的独立归档仓库 dailyPlan，避开 learning-notes/dailyPlan（仅存放 xlsx 的同名子目录）
-    if os.path.isdir(os.path.join(p1, "dailyPlan", ".git")):
-        return p1
-    if os.path.isdir(os.path.join(p2, "dailyPlan", ".git")):
-        return p2
     return p2 if os.path.basename(p1) == "learning-notes" else p1
 
 
 WORKSPACE_ROOT = _find_workspace_root()
 # dailyPlan 归档仓库：plans/=进行中 done/=已确认 practice/=手写练习（可用环境变量覆盖）
 DAILY_REPO = os.environ.get("DAILY_PLAN_REPO") or os.path.join(WORKSPACE_ROOT, "dailyPlan")
-LEARNING_NOTES_DIR = (
-    os.path.dirname(BASE)
-    if os.path.basename(os.path.dirname(BASE)) == "learning-notes"
-    else os.path.join(WORKSPACE_ROOT, "learning-notes")
-)
+LEARNING_NOTES_DIR = os.environ.get("LEARNING_NOTES_DIR") or os.path.join(WORKSPACE_ROOT, "learning-notes")
 LC_NOTES_DIR = os.environ.get("LC_NOTES_DIR") or os.path.join(LEARNING_NOTES_DIR, "leetcode practice")
-IELTS_DIR = os.path.join(LEARNING_NOTES_DIR, "IELTS")
 REPO_PLANS = os.path.join(DAILY_REPO, "plans")
 REPO_DONE = os.path.join(DAILY_REPO, "done")
 PRAC_DIR = os.path.join(DAILY_REPO, "practice")
 for d in (LOGS_DIR, REPO_PLANS, REPO_DONE, PRAC_DIR):
     os.makedirs(d, exist_ok=True)
+
+# ---------- Obsidian 知识库：与上面的仓库并行镜像（存在才启用，不存在则完全跳过） ----------
+OBSIDIAN_VAULT = os.environ.get("OBSIDIAN_VAULT") or os.path.join(WORKSPACE_ROOT, "obsidian-notes")
+OBS_ENABLED = os.path.isdir(os.path.join(OBSIDIAN_VAULT, ".obsidian"))
+OBS_DAILY = os.path.join(OBSIDIAN_VAULT, "10-学习计划", "daily")
+OBS_PLANS = os.path.join(OBS_DAILY, "plans")
+OBS_DONE = os.path.join(OBS_DAILY, "done")
+OBS_PRAC = os.path.join(OBS_DAILY, "practice")
+OBS_LC = os.path.join(OBSIDIAN_VAULT, "03-数据结构与算法", "leetcode practice")
+OBS_LC_NOTES = os.path.join(OBS_LC, "notes")
+OBS_IELTS = os.path.join(OBSIDIAN_VAULT, "08-英语", "IELTS")
+if OBS_ENABLED:
+    for d in (OBS_PLANS, OBS_DONE, OBS_PRAC, OBS_LC_NOTES):
+        os.makedirs(d, exist_ok=True)
+
+# 英语笔记：优先用 Obsidian 库里的 IELTS 周记，其次回退到 learning-notes/IELTS
+IELTS_DIR = OBS_IELTS if (OBS_ENABLED and os.path.isdir(OBS_IELTS)) else os.path.join(LEARNING_NOTES_DIR, "IELTS")
 
 # ---------- 桌面路径（兼容 OneDrive 重定向） ----------
 def desktop_dir():
@@ -151,99 +177,152 @@ def latest_ielts_file():
     return best_path or IELTS_DIR
 
 
-def ensure_lc_note(qmeta, topic, iso, prac_path):
-    """在 learning-notes/leetcode practice/notes/ 下确保当日主练题的笔记模板存在，并在 README.md 登记进度。"""
-    if not os.path.isdir(LC_NOTES_DIR):
-        return None
+def _note_stores():
+    """返回需要同步的刷题笔记库列表：learning-notes 原库 + Obsidian 库（存在才加）。"""
+    stores = []
+    if os.path.isdir(LC_NOTES_DIR):
+        stores.append({"root": LC_NOTES_DIR, "style": "readme"})
+    if OBS_ENABLED and os.path.isdir(OBS_LC_NOTES):
+        stores.append({"root": OBS_LC, "style": "obsidian"})
+    return stores
+
+
+def _note_body(qmeta, topic, iso, prac_path, status="进行中"):
     num, qname, slug, diff, tags, sig, hint, _ = qmeta
-    notes_sub = os.path.join(LC_NOTES_DIR, "notes")
-    os.makedirs(notes_sub, exist_ok=True)
-    note_fname = f"{num:04d}-{qname}.md"
-    note_path = os.path.join(notes_sub, note_fname)
     diff_zh = DIFF_ZH.get(diff, diff)
+    if "design" in tags:
+        code_stub = f"{sig}\n    pass"
+    else:
+        code_stub = f"class Solution:\n    {sig}\n        pass"
+    return [
+        f"- 链接：https://leetcode.cn/problems/{slug}/",
+        f"- 难度：{diff_zh}",
+        f"- 标签：{topic}",
+        f"- 日期：{iso}",
+        f"- 状态：{status}",
+        f"- 本地文件：`{prac_path}`",
+        "",
+        "## 题目",
+        "",
+        "（用自己的话复述题目要求，包括输入、输出、约束条件）",
+        "",
+        "## 我的理解",
+        "",
+        "（这题到底在问什么？边界情况有哪些？）",
+        "",
+        "## 第一版思路",
+        "",
+        "（先自己写，写清楚打算怎么做、为什么这么做）",
+        "",
+        "## 卡点 / 我问的问题",
+        "",
+        "1. ",
+        "2. ",
+        "",
+        "## AI 讲解",
+        "",
+        "（关键点是什么？原思路哪里不对？正确思路是怎么一步步想到的？）",
+        "",
+        "## 代码",
+        "",
+        "```python",
+        code_stub,
+        "```",
+        "",
+        "- 时间复杂度：",
+        "- 空间复杂度：",
+        "",
+        "## 一句话总结",
+        "",
+        "（下次遇到同类题，第一反应应该想什么）",
+        "",
+        "## 复习标记",
+        "",
+        "- 第一次重做：还没做",
+        "- 是否能不看答案写出来：",
+        "",
+    ]
 
-    if not os.path.exists(note_path):
-        if "design" in tags:
-            code_stub = f"{sig}\n    pass"
-        else:
-            code_stub = f"class Solution:\n    {sig}\n        pass"
-        lines = [
-            f"# {num}. {qname}",
-            "",
-            f"- 链接：https://leetcode.cn/problems/{slug}/",
-            f"- 难度：{diff_zh}",
-            f"- 标签：{topic}",
-            f"- 日期：{iso}",
-            "- 状态：进行中",
-            f"- 本地文件：`{prac_path}`",
-            "",
-            "## 题目",
-            "",
-            "（用自己的话复述题目要求，包括输入、输出、约束条件）",
-            "",
-            "## 我的理解",
-            "",
-            "（这题到底在问什么？边界情况有哪些？）",
-            "",
-            "## 第一版思路",
-            "",
-            "（先自己写，写清楚打算怎么做、为什么这么做）",
-            "",
-            "## 卡点 / 我问的问题",
-            "",
-            "1. ",
-            "2. ",
-            "",
-            "## AI 讲解",
-            "",
-            "（关键点是什么？原思路哪里不对？正确思路是怎么一步步想到的？）",
-            "",
-            "## 代码",
-            "",
-            "```python",
-            code_stub,
-            "```",
-            "",
-            "- 时间复杂度：",
-            "- 空间复杂度：",
-            "",
-            "## 一句话总结",
-            "",
-            "（下次遇到同类题，第一反应应该想什么）",
-            "",
-            "## 复习标记",
-            "",
-            "- 第一次重做：还没做",
-            "- 是否能不看答案写出来：",
-            "",
-        ]
-        with open(note_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
 
-    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
-    if os.path.exists(readme_path):
-        try:
-            with open(readme_path, "r", encoding="utf-8-sig") as f:
-                content = f.read()
-            row_key = f"| {num:04d} |"
-            new_row = f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | 进行中 | {iso} |"
-            if row_key not in content:
-                lines = content.splitlines()
-                insert_at = None
-                for i, line in enumerate(lines):
-                    if line.strip().startswith("|---"):
-                        insert_at = i + 1
-                    elif insert_at is not None and line.strip().startswith("|"):
-                        insert_at = i + 1
-                    elif insert_at is not None and not line.strip().startswith("|"):
-                        break
-                if insert_at is not None:
-                    lines.insert(insert_at, new_row)
-                    with open(readme_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-        except Exception as e:
-            print("lc readme update failed:", e, file=sys.stderr)
-    return note_path
+def _obsidian_frontmatter(qmeta, topic, iso, status="进行中"):
+    num, qname, slug, diff = qmeta[0], qmeta[1], qmeta[2], qmeta[3]
+    diff_zh = DIFF_ZH.get(diff, diff)
+    tag_lines = ["  - leetcode"]
+    for t in str(topic).replace("、", ",").split(","):
+        t = t.strip()
+        if t and t != "leetcode":
+            tag_lines.append(f"  - {t}")
+    return [
+        "---",
+        f'title: "{num}. {qname}"',
+        "aliases:",
+        f'  - "{qname}"',
+        "tags:",
+        *tag_lines,
+        f"difficulty: {diff_zh}",
+        f"status: {status}",
+        f"date: {iso}",
+        f"url: https://leetcode.cn/problems/{slug}/",
+        "---",
+    ]
+
+
+def ensure_lc_note(qmeta, topic, iso, prac_path):
+    """同时在 learning-notes 原库与 Obsidian 库中确保当日主练题笔记存在，并在索引里登记。
+
+    Obsidian 侧写成带 YAML frontmatter 的格式，让 Dataview / 学习看板能自动统计；
+    learning-notes 侧维持原来的纯 Markdown 版本 + README 进度表。
+    """
+    num, qname = qmeta[0], qmeta[1]
+    diff_zh = DIFF_ZH.get(qmeta[3], qmeta[3])
+    first_path = None
+
+    for store in _note_stores():
+        root = store["root"]
+        notes_sub = os.path.join(root, "notes")
+        os.makedirs(notes_sub, exist_ok=True)
+        note_fname = f"{num:04d}-{qname}.md"
+        note_path = os.path.join(notes_sub, note_fname)
+        if first_path is None:
+            first_path = note_path
+
+        body = _note_body(qmeta, topic, iso, prac_path)
+        if not os.path.exists(note_path):
+            if store["style"] == "obsidian":
+                lines = _obsidian_frontmatter(qmeta, topic, iso) + [f"# {num}. {qname}", ""]
+                _write_lf(note_path, "\n".join(lines + body))
+            else:
+                lines = [f"# {num}. {qname}", ""]
+                with open(note_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines + body))
+
+        # 索引登记：learning-notes 是手写 Markdown 表格；Obsidian 用 Dataview 自动汇总，无需插行
+        if store["style"] == "readme":
+            readme_path = os.path.join(root, "README.md")
+            if os.path.exists(readme_path):
+                try:
+                    with open(readme_path, "r", encoding="utf-8-sig") as f:
+                        content = f.read()
+                    row_key = f"| {num:04d} |"
+                    new_row = (f"| {num:04d} | [{qname}](notes/{note_fname}) | "
+                               f"{diff_zh} | {topic} | 进行中 | {iso} |")
+                    if row_key not in content:
+                        lines = content.splitlines()
+                        insert_at = None
+                        for i, line in enumerate(lines):
+                            if line.strip().startswith("|---"):
+                                insert_at = i + 1
+                            elif insert_at is not None and line.strip().startswith("|"):
+                                insert_at = i + 1
+                            elif insert_at is not None and not line.strip().startswith("|"):
+                                break
+                        if insert_at is not None:
+                            lines.insert(insert_at, new_row)
+                            with open(readme_path, "w", encoding="utf-8") as f:
+                                f.write("\n".join(lines) + "\n")
+                except Exception as e:
+                    print("lc readme update failed:", e, file=sys.stderr)
+    return first_path
 
 
 def _extract_user_code(prac_path):
@@ -294,47 +373,66 @@ def _find_practice_file(iso, num, slug):
     return os.path.join(PRAC_DIR, candidates[1]), candidates[1]
 
 
-def mark_lc_note_ac(qi, iso, review=False):
-    """确认归档时：将对应题目的刷题笔记与 README 进度表状态更新为 AC，并自动同步已手写的代码。"""
-    if not os.path.isdir(LC_NOTES_DIR):
+def _set_note_state(note_path, num, qname, status, iso=None, review=False, user_code=None,
+                    obsidian=False):
+    """把一份笔记的状态/代码写回；同时兼容 learning-notes 纯列表格式与 Obsidian YAML frontmatter 格式。"""
+    if not note_path or not os.path.exists(note_path):
         return
+    try:
+        with open(note_path, "r", encoding="utf-8-sig") as f:
+            nt = f.read()
+        if obsidian:
+            nt = re.sub(r"^status:.*$", f"status: {status}", nt, flags=re.MULTILINE)
+            nt = re.sub(r"^- 状态：.*$", f"- 状态：{status}", nt, flags=re.MULTILINE)
+        else:
+            nt = re.sub(r"^- 状态：.*$", f"- 状态：{status}", nt, flags=re.MULTILINE)
+        if review:
+            nt = re.sub(r"^- 第一次重做：还没做\s*$",
+                        f"- 第一次重做：{iso} 已复习重做", nt, flags=re.MULTILINE)
+        if user_code:
+            nt = re.sub(
+                r"(## 代码\s+```python\n)([\s\S]*?)(\n```)",
+                lambda m: m.group(1) + user_code + m.group(3),
+                nt,
+                count=1,
+            )
+        if obsidian:
+            _write_lf(note_path, nt)
+        else:
+            with open(note_path, "w", encoding="utf-8") as f:
+                f.write(nt)
+    except Exception as e:
+        print("update lc note failed:", e, file=sys.stderr)
+
+
+def mark_lc_note_ac(qi, iso, review=False):
+    """确认归档时：把对应题目在 learning-notes 与 Obsidian 两个笔记库中的状态同步为 AC，并写回手写代码。"""
     qmeta = qmeta_of(qi)
     topic = lc_entry(qi)[0]
     num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
     prac_path, _ = _find_practice_file(iso, num, slug)
-    note_path = ensure_lc_note(qmeta, topic, iso, prac_path)
-    if note_path and os.path.exists(note_path):
-        try:
-            with open(note_path, "r", encoding="utf-8-sig") as f:
-                nt = f.read()
-            nt = re.sub(r"^- 状态：.*$", "- 状态：AC", nt, flags=re.MULTILINE)
-            if review:
-                nt = re.sub(r"^- 第一次重做：还没做\s*$", f"- 第一次重做：{iso} 已复习重做", nt, flags=re.MULTILINE)
-            user_code = _extract_user_code(prac_path)
-            if user_code:
-                nt = re.sub(
-                    r"(## 代码\s+```python\n)class\s+\w+[\s\S]*?pass(\n```)",
-                    lambda m: m.group(1) + user_code + m.group(2),
-                    nt,
-                    count=1,
-                )
-            with open(note_path, "w", encoding="utf-8") as f:
-                f.write(nt)
-        except Exception as e:
-            print("mark lc note failed:", e, file=sys.stderr)
+    ensure_lc_note(qmeta, topic, iso, prac_path)   # 确保两个库的笔记文件都已存在
+    user_code = _extract_user_code(prac_path)
+    note_fname = f"{num:04d}-{qname}.md"
 
-    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
-    if os.path.exists(readme_path):
-        try:
-            with open(readme_path, "r", encoding="utf-8-sig") as f:
-                rc = f.read()
-            pattern = rf"^(\|\s*{num:04d}\s*\|[^|]+\|[^|]+\|[^|]+\|\s*)(?:进行中|未开始)(\s*\|[^|]+\|)$"
-            rc_new = re.sub(pattern, r"\1AC\2", rc, flags=re.MULTILINE)
-            if rc_new != rc:
-                with open(readme_path, "w", encoding="utf-8") as f:
-                    f.write(rc_new)
-        except Exception as e:
-            print("mark lc readme failed:", e, file=sys.stderr)
+    for store in _note_stores():
+        note_path = os.path.join(store["root"], "notes", note_fname)
+        _set_note_state(note_path, num, qname, "AC", iso=iso, review=review,
+                        user_code=user_code, obsidian=(store["style"] == "obsidian"))
+        if store["style"] == "readme":
+            readme_path = os.path.join(store["root"], "README.md")
+            if os.path.exists(readme_path):
+                try:
+                    with open(readme_path, "r", encoding="utf-8-sig") as f:
+                        rc = f.read()
+                    pattern = (rf"^(\|\s*{num:04d}\s*\|[^|]+\|[^|]+\|[^|]+\|\s*)"
+                               rf"(?:进行中|未开始)(\s*\|[^|]+\|)$")
+                    rc_new = re.sub(pattern, r"\1AC\2", rc, flags=re.MULTILINE)
+                    if rc_new != rc:
+                        with open(readme_path, "w", encoding="utf-8") as f:
+                            f.write(rc_new)
+                except Exception as e:
+                    print("mark lc readme failed:", e, file=sys.stderr)
 
 # ---------- LeetCode 题库：(题号, 题名, slug, 难度, 标签, 方法签名, 思路提示, 用例) ----------
 # 标签: ll=链表 tree=二叉树 design=设计题 set_eq=无序结果集 lol_eq=无序二维列表
@@ -1080,23 +1178,24 @@ def build_practice(qi, qmeta, d, review=False, round_no=1):
     return path, fname
 
 def _flagged_review_qnums():
-    """扫描 leetcode practice/README.md 与 notes/*.md，返回标记了『需二刷 / 不会 / 半懂 / 否』的题号集合。"""
+    """扫描 learning-notes 与 Obsidian 两个笔记库，返回标记了『需二刷 / 不会 / 半懂 / 否』的题号集合。"""
     flagged = set()
-    if not os.path.isdir(LC_NOTES_DIR):
-        return flagged
-    readme_path = os.path.join(LC_NOTES_DIR, "README.md")
-    if os.path.exists(readme_path):
-        try:
-            with open(readme_path, "r", encoding="utf-8-sig") as f:
-                for line in f:
-                    if "需二刷" in line and line.strip().startswith("|"):
-                        m = re.match(r"^\|\s*0*(\d+)\s*\|", line.strip())
-                        if m:
-                            flagged.add(int(m.group(1)))
-        except Exception:
-            pass
-    notes_sub = os.path.join(LC_NOTES_DIR, "notes")
-    if os.path.isdir(notes_sub):
+    for store in _note_stores():
+        root = store["root"]
+        readme_path = os.path.join(root, "README.md")
+        if os.path.exists(readme_path):
+            try:
+                with open(readme_path, "r", encoding="utf-8-sig") as f:
+                    for line in f:
+                        if "需二刷" in line and line.strip().startswith("|"):
+                            m = re.match(r"^\|\s*0*(\d+)\s*\|", line.strip())
+                            if m:
+                                flagged.add(int(m.group(1)))
+            except Exception:
+                pass
+        notes_sub = os.path.join(root, "notes")
+        if not os.path.isdir(notes_sub):
+            continue
         for fn in os.listdir(notes_sub):
             if not fn.endswith(".md"):
                 continue
@@ -1107,7 +1206,8 @@ def _flagged_review_qnums():
             try:
                 with open(os.path.join(notes_sub, fn), "r", encoding="utf-8-sig") as f:
                     txt = f.read()
-                if re.search(r"^- 状态：\s*需二刷", txt, flags=re.MULTILINE):
+                # 兼容 Obsidian YAML（status: 需二刷）与纯 Markdown（- 状态：需二刷）
+                if re.search(r"^(?:status:\s*需二刷|- 状态：\s*需二刷)", txt, flags=re.MULTILINE):
                     flagged.add(qnum)
                 if re.search(r"^- 是否能不看答案写出来：\s*(否|不会|半懂|不能)", txt, flags=re.MULTILINE):
                     flagged.add(qnum)
@@ -1341,8 +1441,8 @@ def main(force=False):
     state["last_date"] = iso
 
     # 今天已确认归档：重启 / 重复触发不得再生成（防止"已完成的任务复活"）
-    # 例外：--py-all 冲刺日或 --regen 需要主动覆盖今天
-    if state["history"].get(iso, {}).get("status") == "done" and not force_regen:
+    # 例外：--py-all 冲刺日需要主动覆盖今天（已归档的日子也拦）；--regen 只能刷新未确认的当天，不会复活已归档日
+    if state["history"].get(iso, {}).get("status") == "done" and "--py-all" not in args:
         print("TODAY_DONE")
         write_run_result({"result": "today_done", "date": iso})
         return
@@ -1381,8 +1481,6 @@ def main(force=False):
         qi, review = h["qi"], h["review"]
         qmeta = qmeta_of(qi)
         carry = pending_dates(iso)
-        if force_regen:
-            h["status"] = "pending"
     else:
         pend = pending_dates(iso)
         if pend:
@@ -1427,7 +1525,13 @@ def main(force=False):
     except Exception as e:
         print("desktop write failed:", e, file=sys.stderr)
 
+    # Obsidian 库镜像：计划 md（带 YAML frontmatter）+ 手写练习骨架 + 脚本/状态副本
+    obs_plan = mirror_plan_to_obsidian(iso, md, plan=plan, qmeta=qmeta, review=review)
+    if qfname:
+        mirror_practice_to_obsidian(qfname)
+
     save_state(state)
+    sync_obsidian_scripts()
 
     # toast 摘要（ps1 读取，避免中文硬编码在 ps1）
     summary = os.path.join(BASE, "last_summary.txt")
@@ -1447,10 +1551,121 @@ def main(force=False):
     print(f"plan: {plan_path}")
     print(f"practice: {path}")
     print(f"desktop: {desktop_ok}")
+    if obs_plan:
+        print(f"obsidian: {obs_plan}")
     write_run_result({"result": "ok", "date": iso,
                       "station": plan["station"], "q": f"{qnum}.{qname}",
                       "review": review, "streak": state["streak"],
-                      "py_stage": py_camp["name"] if py_on else ""})
+                      "py_stage": py_camp["name"] if py_on else "",
+                      "obsidian": obs_plan or ""})
+
+def _obsidian_plan_frontmatter(iso, plan, qmeta, review):
+    num, qname = qmeta[0], qmeta[1]
+    return [
+        "---",
+        f'title: "学习计划 {iso}"',
+        "tags:",
+        "  - 学习计划",
+        "  - 每日计划",
+        f"date: {iso}",
+        "status: 进行中",
+        f"skill_station: {plan.get('station', '')}",
+        f"leetcode: {num}. {qname}",
+        f"review: {'是' if review else '否'}",
+        "---",
+        "",
+    ]
+
+
+def _parse_plan_meta(md):
+    """从计划正文里解析技能站 / 算法题 / 是否复习，供 Obsidian 归档副本补 frontmatter。"""
+    meta = {}
+    m = re.search(r"\*\*当前技能站：([^*]+)\*\*", md)
+    if m:
+        meta["station"] = m.group(1).strip()
+    m = re.search(r"LeetCode (\d+)\. ([^\[（]+?)\s*\[", md)
+    if m:
+        meta["leetcode"] = f"{m.group(1)}. {m.group(2).strip()}"
+    meta["review"] = "是" if "复习重做" in md else "否"
+    return meta
+
+
+def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archived=False):
+    """把每日计划同步一份进 Obsidian 库（plans/ 进行中，done/YYYY-MM/ 已归档）。"""
+    if not OBS_ENABLED:
+        return None
+    target_dir = os.path.join(OBS_DONE, iso[:7]) if archived else OBS_PLANS
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, f"{iso}.md")
+    if plan is not None and qmeta is not None:
+        header = _obsidian_plan_frontmatter(iso, plan, qmeta, review)
+    else:
+        meta = _parse_plan_meta(md)
+        header = [
+            "---",
+            f'title: "学习计划 {iso}"',
+            "tags:",
+            "  - 学习计划",
+            "  - 每日计划",
+            f"date: {iso}",
+            f"status: {'完成' if archived else '进行中'}",
+            f"skill_station: {meta.get('station', '')}",
+            f"leetcode: {meta.get('leetcode', '')}",
+            f"review: {meta.get('review', '否')}",
+            "---",
+            "",
+        ]
+    text = "\n".join(header) + md
+    try:
+        _write_lf(target, text)
+    except Exception as e:
+        print("obsidian plan mirror failed:", e, file=sys.stderr)
+        return None
+    return target
+
+
+def mirror_practice_to_obsidian(fname):
+    """把当日手写练习骨架同步一份进 Obsidian 库的 practice/。"""
+    if not OBS_ENABLED or not fname:
+        return None
+    src = os.path.join(PRAC_DIR, fname)
+    if not os.path.exists(src):
+        return None
+    dst = os.path.join(OBS_PRAC, fname)
+    try:
+        if os.path.abspath(src) != os.path.abspath(dst):
+            # .py 也按字节复制：保留原文件换行风格，避免每次同步都制造整片假 diff
+            shutil.copyfile(src, dst)
+    except Exception as e:
+        print("obsidian practice mirror failed:", e, file=sys.stderr)
+        return None
+    return dst
+
+
+def sync_obsidian_scripts():
+    """把本目录的脚本与运行状态同步到 Obsidian 库内的 daily/ 副本（副本只作备份，不参与运行）。"""
+    if not OBS_ENABLED:
+        return []
+    if os.path.abspath(BASE) == os.path.abspath(OBS_DAILY):
+        return []
+    copied = []
+    names = ("gen_daily.py", "run_daily.ps1", "done.ps1", "commit_evening.ps1",
+             "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", ".gitignore",
+             "state.json", "plan_config.json", "last_summary.txt", "last_run.json")
+    for name in names:
+        src = os.path.join(BASE, name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(OBS_DAILY, name)
+        try:
+            # 一律按字节原样复制：.ps1 的 UTF-8 BOM、.gitignore 的换行符都必须保持，
+            # 转码会让 PowerShell 解析失败或让 git 把整份文件当成改动
+            shutil.copyfile(src, dst)
+            copied.append(name)
+        except Exception as e:
+            print("obsidian script sync failed:", name, e, file=sys.stderr)
+    return copied
+
 
 def _collect_git_commits(iso):
     """扫描 WORKSPACE_ROOT 下各独立 Git 仓库（不含 dailyPlan 归档仓库自身）在指定日期 iso 产生的提交。"""
@@ -1587,6 +1802,17 @@ def confirm(past_only=False):
         h_entry = state["history"][iso]
         h_entry["status"] = "done"
         _finalize_archived_md(iso, dst_path, new_streak, h_entry)
+        # Obsidian 镜像：把归档后的计划（含结算记录）移入 done/YYYY-MM/，并清掉进行中那一份
+        if OBS_ENABLED:
+            try:
+                with open(dst_path, "r", encoding="utf-8-sig") as f:
+                    archived_md = f.read()
+                mirror_plan_to_obsidian(iso, archived_md, archived=True)
+                stale = os.path.join(OBS_PLANS, f"{iso}.md")
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except Exception as e:
+                print("obsidian archive mirror failed:", e, file=sys.stderr)
         if not h_entry.get("py_stage"):
             mark_lc_note_ac(h_entry["qi"], iso, review=bool(h_entry.get("review")))
         p = os.path.join(desktop_dir(), f"学习计划_{iso}.md")
@@ -1605,6 +1831,7 @@ def confirm(past_only=False):
     if past_only and tiso in state["history"] and state["history"][tiso].get("status") == "pending":
         del state["history"][tiso]
     save_state(state)
+    sync_obsidian_scripts()
     print("CONFIRMED:" + ",".join(arch))
     print(f"STREAK:{state['streak']}")
     write_run_result({"result": "confirmed", "dates": arch,
@@ -1790,8 +2017,8 @@ def cmd_stats():
 
 
 def sync_notes_history():
-    """将 state.json 中历史已刷过的所有题目回填到 learning-notes/leetcode practice/ 的笔记库与 README 进度表。"""
-    if not os.path.isdir(LC_NOTES_DIR):
+    """将 state.json 中历史已刷过的所有题目回填到 learning-notes 与 Obsidian 两个笔记库。"""
+    if not _note_stores():
         print("未找到 leetcode practice 目录")
         return
     st = load_state()
@@ -1820,30 +2047,19 @@ def sync_notes_history():
     for qi in sorted(set(seen_qis)):
         qmeta = qmeta_of(qi)
         topic = lc_entry(qi)[0]
-        num, qname, slug, diff = qmeta[0], qmeta[1], qmeta[2], qmeta[3]
-        diff_zh = DIFF_ZH.get(diff, diff)
+        num, qname = qmeta[0], qmeta[1]
+        diff_zh = DIFF_ZH.get(qmeta[3], qmeta[3])
         iso = first_date[qi]
         prac_path = first_prac[qi]
-        note_path = ensure_lc_note(qmeta, topic, iso, prac_path)
+        ensure_lc_note(qmeta, topic, iso, prac_path)
 
         status_str = "需二刷" if num in flagged else ("AC" if qi in done_qis else "进行中")
-        if note_path and os.path.exists(note_path):
-            try:
-                with open(note_path, "r", encoding="utf-8-sig") as f:
-                    nt = f.read()
-                nt = re.sub(r"^- 状态：.*$", f"- 状态：{status_str}", nt, flags=re.MULTILINE)
-                if qi in review_date:
-                    nt = re.sub(
-                        r"^- 第一次重做：还没做\s*$",
-                        f"- 第一次重做：{review_date[qi]} 已周日复习",
-                        nt,
-                        flags=re.MULTILINE,
-                    )
-                with open(note_path, "w", encoding="utf-8") as f:
-                    f.write(nt)
-            except Exception:
-                pass
         note_fname = f"{num:04d}-{qname}.md"
+        for store in _note_stores():
+            note_path = os.path.join(store["root"], "notes", note_fname)
+            _set_note_state(note_path, num, qname, status_str,
+                            iso=review_date.get(qi), review=(qi in review_date),
+                            obsidian=(store["style"] == "obsidian"))
         rows.append(f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | {status_str} | {iso} |")
 
     readme_path = os.path.join(LC_NOTES_DIR, "README.md")
@@ -1870,6 +2086,8 @@ def sync_notes_history():
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(new_lines) + "\n")
     print(f"[OK] 已同步 {len(rows)} 道历史题目至 {LC_NOTES_DIR}")
+    if OBS_ENABLED:
+        print(f"[OK] 同一批题目已同步至 Obsidian：{OBS_LC_NOTES}")
 
 
 def cmd_mark_review(args):
@@ -1885,13 +2103,10 @@ def cmd_mark_review(args):
     qmeta = Q[QN2I[target_num]]
     qname = qmeta[1]
     note_fname = f"{target_num:04d}-{qname}.md"
-    note_path = os.path.join(LC_NOTES_DIR, "notes", note_fname)
-    if os.path.exists(note_path):
-        with open(note_path, "r", encoding="utf-8-sig") as f:
-            nt = f.read()
-        nt = re.sub(r"^- 状态：.*$", "- 状态：需二刷", nt, flags=re.MULTILINE)
-        with open(note_path, "w", encoding="utf-8") as f:
-            f.write(nt)
+    for store in _note_stores():
+        note_path = os.path.join(store["root"], "notes", note_fname)
+        _set_note_state(note_path, target_num, qname, "需二刷",
+                        obsidian=(store["style"] == "obsidian"))
     readme_path = os.path.join(LC_NOTES_DIR, "README.md")
     if os.path.exists(readme_path):
         with open(readme_path, "r", encoding="utf-8-sig") as f:
@@ -1902,6 +2117,74 @@ def cmd_mark_review(args):
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(rc_new)
     print(f"[OK] 已将 LC {target_num}. {qname} 标记为『需二刷』，下个周日将优先抽考！")
+
+
+def cmd_sync_obsidian(args):
+    """把 dailyPlan 仓库、刷题笔记库、IELTS 周记与脚本一次性全量镜像进 Obsidian 库。"""
+    if not OBS_ENABLED:
+        print(f"未找到 Obsidian 库：{OBSIDIAN_VAULT}（需要 .obsidian 目录）")
+        return
+    copied_scripts = sync_obsidian_scripts()
+    n_plan = n_done = n_prac = n_ielts = 0
+
+    # 进行中的计划
+    if os.path.isdir(REPO_PLANS):
+        for fn in sorted(os.listdir(REPO_PLANS)):
+            if not fn.endswith(".md"):
+                continue
+            iso = fn[:-3]
+            with open(os.path.join(REPO_PLANS, fn), "r", encoding="utf-8-sig") as f:
+                md = f.read()
+            if mirror_plan_to_obsidian(iso, md):
+                n_plan += 1
+
+    # 已归档的计划
+    if os.path.isdir(REPO_DONE):
+        for month in sorted(os.listdir(REPO_DONE)):
+            mdir = os.path.join(REPO_DONE, month)
+            if not os.path.isdir(mdir):
+                continue
+            for fn in sorted(os.listdir(mdir)):
+                if not fn.endswith(".md"):
+                    continue
+                iso = fn[:-3]
+                with open(os.path.join(mdir, fn), "r", encoding="utf-8-sig") as f:
+                    md = f.read()
+                if mirror_plan_to_obsidian(iso, md, archived=True):
+                    n_done += 1
+
+    # 手写练习
+    if os.path.isdir(PRAC_DIR):
+        for fn in sorted(os.listdir(PRAC_DIR)):
+            if fn.endswith(".py") and mirror_practice_to_obsidian(fn):
+                n_prac += 1
+
+    # 刷题笔记（两个库都会补齐 / 校正状态）
+    sync_notes_history()
+
+    # IELTS：只补 Obsidian 里缺失的周，不覆盖已有手写内容
+    src_ielts = os.path.join(LEARNING_NOTES_DIR, "IELTS")
+    if os.path.isdir(src_ielts) and os.path.isdir(OBS_IELTS):
+        for fn in sorted(os.listdir(src_ielts)):
+            m = re.search(r"(\d+)", fn)
+            if not fn.lower().endswith((".md", ".txt")) or not m:
+                continue
+            week = int(m.group(1))
+            target = os.path.join(OBS_IELTS, f"IELTS Week {week}.md")
+            if os.path.exists(target):
+                continue
+            try:
+                with open(os.path.join(src_ielts, fn), "r", encoding="utf-8-sig") as rf:
+                    _write_lf(target, rf.read())
+                n_ielts += 1
+            except Exception as e:
+                print("ielts mirror failed:", fn, e, file=sys.stderr)
+
+    print(f"[OK] Obsidian 镜像完成：脚本 {len(copied_scripts)} 个｜进行中计划 {n_plan}｜归档计划 {n_done}"
+          f"｜练习 {n_prac}｜新增 IELTS {n_ielts}")
+    print(f"     库路径：{OBSIDIAN_VAULT}")
+    write_run_result({"result": "obsidian_synced", "scripts": len(copied_scripts),
+                      "plans": n_plan, "done": n_done, "practice": n_prac, "ielts": n_ielts})
 
 
 def cmd_open():
@@ -1917,8 +2200,8 @@ def cmd_open():
     qmeta = qmeta_of(qi)
     topic = lc_entry(qi)[0]
     num, qname, slug = qmeta[0], qmeta[1], qmeta[2]
-    prac_path, _ = _find_practice_file(tiso, num, slug)
-    note_path = ensure_lc_note(qmeta, topic, tiso, prac_path)
+    prac_full, _ = _find_practice_file(tiso, num, slug)
+    note_path = ensure_lc_note(qmeta, topic, tiso, prac_full)
     dp = os.path.join(desktop_dir(), f"学习计划_{tiso}.md")
     plan_file = dp if os.path.exists(dp) else os.path.join(REPO_PLANS, f"{tiso}.md")
     if not os.path.exists(plan_file):
@@ -1926,7 +2209,19 @@ def cmd_open():
         if os.path.exists(done_file):
             plan_file = done_file
 
-    files_to_open = [p for p in (plan_file, prac_path, note_path) if p and os.path.exists(p)]
+    # 用 Obsidian 库里的版本优先（你在 Obsidian 里看笔记），否则回退到仓库版本
+    prac_obs = os.path.join(OBS_PRAC, os.path.basename(prac_full))
+    note_obs = os.path.join(OBS_LC_NOTES, os.path.basename(note_path))
+    plan_obs = os.path.join(OBS_PLANS, f"{tiso}.md")
+    if not os.path.exists(plan_obs):
+        plan_obs = os.path.join(OBS_DONE, tiso[:7], f"{tiso}.md")
+    plan_file = plan_obs if (OBS_ENABLED and os.path.exists(plan_obs)) else plan_file
+    if OBS_ENABLED and os.path.exists(note_obs):
+        note_path = note_obs
+    if OBS_ENABLED and os.path.exists(prac_obs):
+        prac_full = prac_obs
+
+    files_to_open = [p for p in (plan_file, prac_full, note_path) if p and os.path.exists(p)]
     code_candidates = [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Microsoft VS Code", "Code.exe"),
         r"C:\Program Files\Microsoft VS Code\Code.exe",
@@ -1964,6 +2259,8 @@ if __name__ == "__main__":
         confirm(past_only="--past-only" in args)
     elif "--sync-notes" in args:
         sync_notes_history()
+    elif "--sync-obsidian" in args:
+        cmd_sync_obsidian(args)
     elif "--mark-review" in args:
         cmd_mark_review(args)
     elif "--open" in args:
