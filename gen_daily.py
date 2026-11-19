@@ -1883,6 +1883,7 @@ def sync_obsidian_scripts():
         return []
     copied = []
     names = ("gen_daily.py", "knowledge_map.py", "graph_links.py",
+             "obsidian_sync.py", "build_manifest.py", "obsidian_manifest.json",
              "run_daily.ps1", "done.ps1", "commit_evening.ps1",
              "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", "sync_all.ps1",
              "silent_runner.vbs", ".gitignore",
@@ -2475,6 +2476,17 @@ def cmd_sync_obsidian(args):
                 n_ielts += 1
             except Exception as e:
                 print("ielts mirror failed:", fn, e, file=sys.stderr)
+
+    # 通用同步：learning-notes 里其它目录的新笔记（obsidian_sync.py 只增不改）
+    try:
+        _nsync = [sys.executable, "-X", "utf8", os.path.join(BASE, "obsidian_sync.py"), "--quiet"]
+        _r = _run_quiet(_nsync, timeout=180)
+        _out = (_r.stdout or "").strip()
+        if _out:
+            for _line in _out.splitlines()[-4:]:
+                print(_line)
+    except Exception as e:
+        print("general obsidian sync failed:", e, file=sys.stderr)
 
     print(f"[OK] Obsidian 镜像完成：脚本 {len(copied_scripts)} 个｜进行中计划 {n_plan}｜归档计划 {n_done}"
           f"｜练习 {n_prac}｜新增 IELTS {n_ielts}")
