@@ -18,6 +18,11 @@ try:
 except Exception as _km_err:  # 映射表缺失时降级运行，不影响计划生成
     KM = None
     print("knowledge_map.py not available:", _km_err, file=sys.stderr)
+try:
+    import graph_links as GL
+except Exception as _gl_err:  # 图谱连接层缺失时降级
+    GL = None
+    print("graph_links.py not available:", _gl_err, file=sys.stderr)
 LOGS_DIR = os.path.join(BASE, "logs")
 STATE_FILE = os.path.join(BASE, "state.json")
 # 供 ps1 读取的机器可读结果（Python 直接写 UTF-8，绕过 PS 捕获子进程输出的 GBK 乱码坑）
@@ -1607,8 +1612,12 @@ def main(force=False):
         print("desktop write failed:", e, file=sys.stderr)
 
     # Obsidian 库镜像：计划 md（带 YAML frontmatter）+ 手写练习骨架 + 脚本/状态副本
+    _lc_topic = lc[0] if lc else None
     obs_plan = mirror_plan_to_obsidian(iso, md, plan=plan, qmeta=qmeta, review=review,
-                                       topic=(lc[0] if lc else None))
+                                       topic=_lc_topic)
+    # 图谱连接：正文写入知识点 / 刷题笔记 / 前后日期双链（Dataview 不产生连线）
+    link_plan_graph(iso, archived=False, qmeta=qmeta, topic=_lc_topic)
+    link_note_graph(qmeta, _lc_topic, iso=iso)
     if qfname:
         mirror_practice_to_obsidian(qfname)
 
@@ -1686,6 +1695,131 @@ def _parse_plan_meta(md):
     return meta
 
 
+def _note_stem_for(qmeta):
+    """Obsidian 刷题笔记的文件名（不含 .md），用于双链。"""
+    return f"{qmeta[0]:04d}-{qmeta[1]}"
+
+
+def _adjacent_plan_dates(iso, archived):
+    """返回 (前一天 iso, 后一天 iso)；只在已有计划文件里找相邻项。"""
+    if not OBS_ENABLED:
+        return None, None
+    pool = set()
+    for base in (OBS_PLANS, OBS_DONE):
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _, filenames in os.walk(base):
+            for fn in filenames:
+                if fn.endswith(".md") and re.match(r"^\d{4}-\d{2}-\d{2}\.md$", fn):
+                    pool.add(fn[:-3])
+    pool = sorted(pool)
+    prev_iso = next_iso = None
+    for i, d in enumerate(pool):
+        if d == iso:
+            if i > 0:
+                prev_iso = pool[i - 1]
+            if i + 1 < len(pool):
+                next_iso = pool[i + 1]
+            break
+    return prev_iso, next_iso
+
+
+def link_plan_graph(iso, archived, qmeta=None, topic=None):
+    """给镜像后的计划补正文双链（知识点 / 刷题笔记 / 前后日期 / 索引页）。"""
+    if not OBS_ENABLED or GL is None:
+        return False
+    target_dir = os.path.join(OBS_DONE, iso[:7]) if archived else OBS_PLANS
+    path = os.path.join(target_dir, f"{iso}.md")
+    if not os.path.exists(path):
+        return False
+    main_k, rel_k = (None, [])
+    note_stem = None
+    if qmeta is not None:
+        main_k, rel_k = _knowledge_links(qmeta[0], topic or "")
+        note_stem = _note_stem_for(qmeta)
+    prev_iso, next_iso = _adjacent_plan_dates(iso, archived)
+    station = None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except Exception:
+        text = ""
+    m = re.search(r"^skill_station:\s*(.+)$", text, re.M)
+    if m:
+        station = m.group(1).strip()
+    # 没有 qmeta 时（全量同步历史归档），从正文/属性反解题号
+    if qmeta is None and not note_stem:
+        m = re.search(r"^leetcode:\s*(\d+)\.\s*(.+)$", text, re.M)
+        if not m:
+            m = re.search(r"LeetCode (\d+)\.\s*([^\[（\n]+)", text)
+        if m:
+            try:
+                _num = int(m.group(1))
+                note_stem = _find_note_stem_by_number(_num, m.group(2).strip())
+                if note_stem:
+                    _tp = _topic_from_note(note_stem) or ""
+                    main_k, rel_k = _knowledge_links(_num, _tp)
+            except Exception:
+                pass
+    try:
+        return GL.inject_plan_links(path, iso, main_k, rel_k, note_stem,
+                                    prev_iso, next_iso, station=station)
+    except Exception as e:
+        print("plan graph link failed:", e, file=sys.stderr)
+        return False
+
+
+def _find_note_stem_by_number(num, qname_hint=""):
+    """按题号在 Obsidian 笔记目录里找真实文件名（不含 .md）。"""
+    if not OBS_ENABLED or not os.path.isdir(OBS_LC_NOTES):
+        return None
+    prefix = f"{num:04d}-"
+    for fn in os.listdir(OBS_LC_NOTES):
+        if fn.startswith(prefix) and fn.endswith(".md"):
+            return fn[:-3]
+    return None
+
+
+def _topic_from_note(note_stem):
+    """从笔记 frontmatter 的 tags 里读出主题，用于反查知识点。"""
+    path = os.path.join(OBS_LC_NOTES, note_stem + ".md")
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            head = f.read(800)
+    except Exception:
+        return ""
+    m = re.search(r"^tags:\s*\n((?:\s+-\s*.+\n)+)", head, re.M)
+    if m:
+        for line in m.group(1).splitlines():
+            t = line.strip()
+            if t.startswith("-"):
+                t = t[1:].strip()
+                if KM is not None and t in KM.TOPIC_KNOWLEDGE:
+                    return t
+    return ""
+
+
+def link_note_graph(qmeta, topic, iso=None):
+    """给两边的刷题笔记补正文双链（Obsidian 侧才有效，learning-notes 也写上无妨）。"""
+    if GL is None:
+        return 0
+    main_k, rel_k = _knowledge_links(qmeta[0], topic or "")
+    if not main_k:
+        return 0
+    done = 0
+    for store in _note_stores():
+        notes_sub = os.path.join(store["root"], "notes")
+        path = os.path.join(notes_sub, _note_stem_for(qmeta) + ".md")
+        try:
+            if GL.inject_note_links(path, main_k, rel_k, plan_iso=iso):
+                done += 1
+        except Exception as e:
+            print("note graph link failed:", path, e, file=sys.stderr)
+    return done
+
+
 def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archived=False, topic=None):
     """把每日计划同步一份进 Obsidian 库（plans/ 进行中，done/YYYY-MM/ 已归档）。"""
     if not OBS_ENABLED:
@@ -1748,7 +1882,8 @@ def sync_obsidian_scripts():
     if os.path.abspath(BASE) == os.path.abspath(OBS_DAILY):
         return []
     copied = []
-    names = ("gen_daily.py", "knowledge_map.py", "run_daily.ps1", "done.ps1", "commit_evening.ps1",
+    names = ("gen_daily.py", "knowledge_map.py", "graph_links.py",
+             "run_daily.ps1", "done.ps1", "commit_evening.ps1",
              "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", "sync_all.ps1",
              "silent_runner.vbs", ".gitignore",
              "state.json", "plan_config.json", "last_summary.txt", "last_run.json")
@@ -1911,6 +2046,14 @@ def confirm(past_only=False):
                 stale = os.path.join(OBS_PLANS, f"{iso}.md")
                 if os.path.exists(stale):
                     os.remove(stale)
+                # 归档后重新注入双链（此时「后一天」可能已存在）
+                try:
+                    _qi = h_entry.get("qi")
+                    _qm = qmeta_of(_qi) if _qi is not None else None
+                    _tp = lc_entry(_qi)[0] if _qi is not None else None
+                    link_plan_graph(iso, archived=True, qmeta=_qm, topic=_tp)
+                except Exception as e:
+                    print("archive graph link failed:", e, file=sys.stderr)
             except Exception as e:
                 print("obsidian archive mirror failed:", e, file=sys.stderr)
         if not h_entry.get("py_stage"):
@@ -2206,6 +2349,11 @@ def sync_notes_history():
                             obsidian=(store["style"] == "obsidian"))
             if store["style"] == "obsidian":
                 _inject_knowledge_field(note_path, num, topic)
+            # 正文双链：这是图谱连线的真正来源（Dataview 表不产生连线）
+            try:
+                link_note_graph(qmeta, topic, iso=iso)
+            except Exception as e:
+                print("note graph link failed:", e, file=sys.stderr)
         rows.append(f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | {status_str} | {iso} |")
 
     readme_path = os.path.join(LC_NOTES_DIR, "README.md")
@@ -2282,6 +2430,7 @@ def cmd_sync_obsidian(args):
             with open(os.path.join(REPO_PLANS, fn), "r", encoding="utf-8-sig") as f:
                 md = f.read()
             if mirror_plan_to_obsidian(iso, md):
+                link_plan_graph(iso, archived=False)
                 n_plan += 1
 
     # 已归档的计划
@@ -2297,6 +2446,7 @@ def cmd_sync_obsidian(args):
                 with open(os.path.join(mdir, fn), "r", encoding="utf-8-sig") as f:
                     md = f.read()
                 if mirror_plan_to_obsidian(iso, md, archived=True):
+                    link_plan_graph(iso, archived=True)
                     n_done += 1
 
     # 手写练习
