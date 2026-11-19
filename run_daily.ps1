@@ -92,6 +92,14 @@ try {
         try { Pop-Location } catch {}
     }
 
+    # 3.5) 通用同步：learning-notes 里其它目录的新笔记（只增不改，不会动已整理的文件）
+    try {
+        $syncOut = & $py -X utf8 (Join-Path $dir "obsidian_sync.py") --quiet 2>&1 | Out-String
+        if ($syncOut.Trim()) { Write-Log $syncOut.Trim() }
+    } catch {
+        Write-Log "obsidian_sync failed: $_"
+    }
+
     # 4) 同步推送 Obsidian 库（计划/练习/笔记镜像都在里面）
     if ($vault) {
         try {
