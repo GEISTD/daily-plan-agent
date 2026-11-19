@@ -1,5 +1,6 @@
 ﻿# 一键开启今日学习工作台（由桌面「🚀开始今日学习.vbs」调用）
-# 若今日未生成先生成 → VS Code 同时打开计划/练习.py/刷题笔记 → 浏览器打开 LeetCode 题目页
+# 若今日未生成先生成 → VS Code 同时打开计划/练习/刷题笔记 → 浏览器打开题目页
+# 本身通过 silent_runner.vbs 以 SW_HIDE 启动，全程不出现控制台窗口
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8

@@ -1749,7 +1749,8 @@ def sync_obsidian_scripts():
         return []
     copied = []
     names = ("gen_daily.py", "knowledge_map.py", "run_daily.ps1", "done.ps1", "commit_evening.ps1",
-             "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", "sync_all.ps1", ".gitignore",
+             "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", "sync_all.ps1",
+             "silent_runner.vbs", ".gitignore",
              "state.json", "plan_config.json", "last_summary.txt", "last_run.json")
     for name in names:
         src = os.path.join(BASE, name)

@@ -24,7 +24,7 @@ function Write-Log([string]$Text) {
 
 $rr = $null
 $acVerified = $false
-$aborted = $false
+$acWarning = ""
 $mtx = New-Object System.Threading.Mutex($false, "Local\AIPlanDailyRun")
 $locked = $false
 try {
@@ -45,25 +45,13 @@ try {
         if ($chk -and ($chk.check -eq "ac")) {
             $acVerified = $true
         } elseif ($chk -and ($chk.check -in @("todo", "fail"))) {
-            try {
-                $ws = New-Object -ComObject WScript.Shell
-                $msg = "检测到今日练习代码尚未本地跑通 AC!`n`n题目：$($chk.q)`n文件：$($chk.file)`n状态：$($chk.reason)`n`n[是] 我已在网页端完成 / 仍要强制确认归档`n[否] 先不归档，回去把本地代码跑通 AC!"
-                $ans = $ws.Popup($msg, 120, "每日计划 · 练习代码自检", 4 + 48)
-                if ($ans -ne 6) {
-                    $aborted = $true
-                    Write-Log "confirm aborted by user after AC check (ans=$ans)"
-                } else {
-                    Write-Log "user forced confirm despite check=$($chk.check)"
-                }
-            } catch {
-                Write-Log "check popup failed: $_"
-            }
+            # 不再弹模态对话框抢焦点：记日志 + 后面用 Toast 提示，你仍可选择继续归档
+            Write-Log "practice not AC ($($chk.check)): $($chk.reason)"
+            $acWarning = "⚠ 本地未跑通 AC（$($chk.check)）：$($chk.reason)"
         }
 
-        if (-not $aborted) {
-            $cOut = & $py -X utf8 (Join-Path $dir "gen_daily.py") --confirm 2>&1 | Out-String
-            Write-Log $cOut.Trim()
-        }
+        $cOut = & $py -X utf8 (Join-Path $dir "gen_daily.py") --confirm 2>&1 | Out-String
+        Write-Log $cOut.Trim()
     }
 }
 catch {
@@ -72,10 +60,6 @@ catch {
 finally {
     if ($locked) { $mtx.ReleaseMutex() | Out-Null }
     $mtx.Dispose()
-}
-
-if ($aborted) {
-    exit 0
 }
 
 if (-not $l1) {
@@ -136,6 +120,7 @@ if ($l1) {
     }
     if ($pushed) { $l2 = "${acTag}已推送 GitHub dailyPlan ｜ 连续打卡 $streak 天" }
     else { $l2 = "${acTag}本地已归档（推送失败，下次自动补推）｜ 连续打卡 $streak 天" }
+    if ($acWarning) { $l2 = "$acWarning ｜ $l2" }
 
     # 同步推送 Obsidian 库（归档计划、AC 笔记与代码回写都在里面）
     if ($vault) {

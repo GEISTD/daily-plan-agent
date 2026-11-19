@@ -27,24 +27,14 @@ function Write-Log([string]$Text) {
 }
 
 try {
-    # 0) 补确认弹窗：有未确认的遗留计划且今天还没生成过 → 先问"完成了没"
+    # 0) 有未确认的遗留计划时：不再弹模态对话框（会抢焦点、打断工作），
+    #    改为静默沿用同一题 + Toast 提醒。想归档旧计划就双击桌面「✅完成今日计划」。
     $statusOut = & $py -X utf8 (Join-Path $dir "gen_daily.py") --status 2>&1
     $carry = ($statusOut | Select-String "^CARRY:(.+)").Matches.Groups[1].Value
     $todayEntry = ($statusOut | Select-String "^TODAY_ENTRY:(\w+)").Matches.Groups[1].Value
-    if ($carry -and $carry -ne "none" -and $todayEntry -eq "no") {
-        try {
-            $ws = New-Object -ComObject WScript.Shell
-            $r = $ws.Popup("检测到之前（$carry）的计划还没确认完成。`n`n[是] 我已完成 → 归档并生成新题`n[否] 没完成 → 今天继续同一题`n（10 分钟无操作默认未完成）", 600, "每日计划 · 昨日确认", 4 + 48)
-            if ($r -eq 6) {
-                $cOut = & $py -X utf8 (Join-Path $dir "gen_daily.py") --confirm --past-only 2>&1 | Out-String
-                Write-Log $cOut.Trim()
-                Write-Log "popup-confirmed: past plans archived"
-            } else {
-                Write-Log "popup-answer: $r (carry over)"
-            }
-        } catch {
-            Write-Log "popup failed: $_"
-        }
+    $hasCarry = $carry -and $carry -ne "none" -and $todayEntry -eq "no"
+    if ($hasCarry) {
+        Write-Log "carry over pending: $carry (silent, no popup)"
     }
 
     # 1) 生成计划与练习文件（幂等：同一天已生成返回 already_exists，已确认返回 today_done）
@@ -62,11 +52,15 @@ try {
             [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
             $tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
             $sumFile = Join-Path $dir "last_summary.txt"
+            $t = $tpl.GetElementsByTagName("text")
             if (Test-Path $sumFile) {
                 $lines = Get-Content $sumFile -Encoding UTF8
-                $t = $tpl.GetElementsByTagName("text")
                 $t.Item(0).AppendChild($tpl.CreateTextNode($lines[0])) | Out-Null
                 if ($lines.Count -gt 1) { $t.Item(1).AppendChild($tpl.CreateTextNode($lines[1])) | Out-Null }
+            }
+            if ($hasCarry) {
+                # 有遗留未确认：在摘要里补一句，引导用户去点确认，而不是弹窗打断
+                $t.Item(1).AppendChild($tpl.CreateTextNode("（有未确认的旧计划：$carry，完成后双击「✅完成今日计划」归档）")) | Out-Null
             }
             $toast = [Windows.UI.Notifications.ToastNotification]::new($tpl)
             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("AI Daily Plan").Show($toast)
