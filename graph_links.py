@@ -82,8 +82,8 @@ def inject_plan_links(path, iso, main_k, related, note_stem, prev_iso, next_iso,
             while insert_at < len(lines) and not lines[insert_at].strip():
                 insert_at += 1
             break
-    new_lines = lines[:insert_at] + ["", block, ""] + lines[insert_at:]
-    new_body = "\n".join(new_lines)
+    new_lines = lines[:insert_at] + [block, ""] + lines[insert_at:]
+    new_body = re.sub(r"\n{3,}", "\n\n", "\n".join(new_lines))
     new_text = fm + new_body
     if new_text != text:
         _write_lf(path, new_text)
