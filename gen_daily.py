@@ -12,6 +12,12 @@ import importlib.util, json, os, random, re, shutil, subprocess, sys
 from datetime import date, datetime, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+try:
+    import knowledge_map as KM
+except Exception as _km_err:  # 映射表缺失时降级运行，不影响计划生成
+    KM = None
+    print("knowledge_map.py not available:", _km_err, file=sys.stderr)
 LOGS_DIR = os.path.join(BASE, "logs")
 STATE_FILE = os.path.join(BASE, "state.json")
 # 供 ps1 读取的机器可读结果（Python 直接写 UTF-8，绕过 PS 捕获子进程输出的 GBK 乱码坑）
@@ -28,6 +34,31 @@ def _write_lf(path, text):
     用默认 CRLF 写会让每次同步都产生一整片假的 diff。"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+# ---------- 后台静默执行（Windows 下不弹黑窗） ----------
+# 计划任务本身是隐藏运行的，但 Python 调 git.exe / python.exe 这类控制台程序时，
+# Windows 仍会为子进程创建控制台窗口并一闪而过。统一加 CREATE_NO_WINDOW 消除。
+_NO_WINDOW = 0
+if os.name == "nt":
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _run_quiet(cmd, timeout=10, **kwargs):
+    """执行外部命令且不弹出控制台窗口；返回 subprocess.CompletedProcess。"""
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs.setdefault("startupinfo", si)
+        kwargs.setdefault("creationflags", _NO_WINDOW)
+    if "capture_output" not in kwargs and "stdout" not in kwargs:
+        kwargs["capture_output"] = True
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    kwargs.setdefault("timeout", timeout)
+    return subprocess.run(cmd, **kwargs)
 
 
 def _find_workspace_root():
@@ -187,20 +218,36 @@ def _note_stores():
     return stores
 
 
+def _knowledge_links(qnum, topic):
+    """返回 (主知识点, [相关知识点])；映射表缺失时降级为空，不影响计划生成。"""
+    if KM is None:
+        return None, []
+    try:
+        main, related = KM.knowledge_for(qnum, topic)
+        return main, [r for r in related if r != main]
+    except Exception:
+        return None, []
+
+
 def _note_body(qmeta, topic, iso, prac_path, status="进行中"):
     num, qname, slug, diff, tags, sig, hint, _ = qmeta
     diff_zh = DIFF_ZH.get(diff, diff)
+    main_k, rel_k = _knowledge_links(num, topic)
     if "design" in tags:
         code_stub = f"{sig}\n    pass"
     else:
         code_stub = f"class Solution:\n    {sig}\n        pass"
-    return [
+    head = [
         f"- 链接：https://leetcode.cn/problems/{slug}/",
         f"- 难度：{diff_zh}",
         f"- 标签：{topic}",
         f"- 日期：{iso}",
         f"- 状态：{status}",
         f"- 本地文件：`{prac_path}`",
+    ]
+    if main_k:
+        head.append(f"- 知识点：[[{main_k}]]")
+    return head + [
         "",
         "## 题目",
         "",
@@ -252,6 +299,17 @@ def _obsidian_frontmatter(qmeta, topic, iso, status="进行中"):
         t = t.strip()
         if t and t != "leetcode":
             tag_lines.append(f"  - {t}")
+    main_k, rel_k = _knowledge_links(num, topic)
+    extra = []
+    if main_k:
+        # knowledge 只放主知识点（一个），保证统计不重复计数；
+        # 关联知识点单独放 knowledge_related，只用于导航，不参与题数统计。
+        extra.append("knowledge:")
+        extra.append(f'  - "{main_k}"')
+        if rel_k:
+            extra.append("knowledge_related:")
+            for r in rel_k:
+                extra.append(f'  - "{r}"')
     return [
         "---",
         f'title: "{num}. {qname}"',
@@ -263,6 +321,7 @@ def _obsidian_frontmatter(qmeta, topic, iso, status="进行中"):
         f"status: {status}",
         f"date: {iso}",
         f"url: https://leetcode.cn/problems/{slug}/",
+        *extra,
         "---",
     ]
 
@@ -1364,8 +1423,15 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, lc=None, wee
             L.append("")
     elif lc_on:
         topic, _, extras = lc
+        main_k, rel_k = _knowledge_links(num, topic)
         L.append("## 2. 算法闯关（30-40 分钟）")
         L.append(f"**今日主题：{topic}** ｜ {qtag}")
+        if main_k:
+            kn = f"**今日知识点：[[{main_k}]]**"
+            if rel_k:
+                kn += " ｜ 关联：" + " · ".join(f"[[{r}]]" for r in rel_k)
+            L.append(kn)
+            L.append(f"      做题前先扫一眼 [[{main_k}]] 的「识别信号」和「常见坑」，做完回来补一句自己的话。")
         L.append(f"- [ ] **主练（手写跑通 AC）**：LeetCode {num}. {qname} [{diff}]")
         L.append(f"      练习文件已生成：`{prac_full}` —— 在 VS Code 打开手写，本地跑通看到 AC!（禁止纸上默写）")
         if note_path:
@@ -1413,6 +1479,21 @@ def build_md(d, plan, qmeta, qi, review, qfname, state, carry=None, lc=None, wee
     L.append("- 不粘贴没读懂的长代码；核心代码（损失/训练循环/检索/评估/路由）必须自己写")
     L.append("")
     next_no += 1
+
+    # 知识点回顾：只在该题真的挂了知识点时出现
+    k_topic = lc[0] if lc_on else ""
+    main_k, rel_k = _knowledge_links(num, k_topic)
+    if main_k:
+        L.append(f"## {next_no}. 知识点回顾（做完题花 3 分钟）")
+        L.append(f"1. 打开 [[{main_k}]]，对照「识别信号」写一句：**这题为什么属于它**。")
+        L.append(f"2. 对照「常见坑」自查：今天有没有踩到其中一条？踩到了就把当时的现象补进那一条下面。")
+        if rel_k:
+            L.append(f"3. 顺带扫一眼关联知识点：{' · '.join(f'[[{r}]]' for r in rel_k)}，确认没有混淆。")
+        L.append(f"4. 如果发现自己用了别的套路，说明映射要调：改 `daily/knowledge_map.py` 里 "
+                 f"`QUESTION_KNOWLEDGE[{num}]`，下次生成自动生效。")
+        L.append("")
+        next_no += 1
+
     L.append(f"## {next_no}. 完成后（确认归档）")
     L.append("0. **一键开启工作台**：双击桌面「🚀开始今日学习」（或运行 `python gen_daily.py --open`），自动用 VS Code 打开本计划 + 练习 `.py` + 刷题笔记并打开网页题目")
     if py_all:
@@ -1526,7 +1607,8 @@ def main(force=False):
         print("desktop write failed:", e, file=sys.stderr)
 
     # Obsidian 库镜像：计划 md（带 YAML frontmatter）+ 手写练习骨架 + 脚本/状态副本
-    obs_plan = mirror_plan_to_obsidian(iso, md, plan=plan, qmeta=qmeta, review=review)
+    obs_plan = mirror_plan_to_obsidian(iso, md, plan=plan, qmeta=qmeta, review=review,
+                                       topic=(lc[0] if lc else None))
     if qfname:
         mirror_practice_to_obsidian(qfname)
 
@@ -1559,9 +1641,10 @@ def main(force=False):
                       "py_stage": py_camp["name"] if py_on else "",
                       "obsidian": obs_plan or ""})
 
-def _obsidian_plan_frontmatter(iso, plan, qmeta, review):
+def _obsidian_plan_frontmatter(iso, plan, qmeta, review, topic=None):
     num, qname = qmeta[0], qmeta[1]
-    return [
+    main_k, rel_k = _knowledge_links(num, topic or plan.get("station", ""))
+    lines = [
         "---",
         f'title: "学习计划 {iso}"',
         "tags:",
@@ -1572,9 +1655,17 @@ def _obsidian_plan_frontmatter(iso, plan, qmeta, review):
         f"skill_station: {plan.get('station', '')}",
         f"leetcode: {num}. {qname}",
         f"review: {'是' if review else '否'}",
-        "---",
-        "",
     ]
+    if main_k:
+        lines.append("knowledge:")
+        lines.append(f'  - "{main_k}"')
+        if rel_k:
+            lines.append("knowledge_related:")
+            for r in rel_k:
+                lines.append(f'  - "{r}"')
+    lines.append("---")
+    lines.append("")
+    return lines
 
 
 def _parse_plan_meta(md):
@@ -1587,10 +1678,15 @@ def _parse_plan_meta(md):
     if m:
         meta["leetcode"] = f"{m.group(1)}. {m.group(2).strip()}"
     meta["review"] = "是" if "复习重做" in md else "否"
+    # 知识点双链：正文里「今日知识点：[[xxx]] ｜ 关联：[[a]] · [[b]]」
+    meta["knowledge"] = re.findall(r"\[\[([^\]|#]+)\]\]", md)
+    # 只保留真正的知识点（排除题单、索引这类导航链接）
+    skip = {"LeetCode 刷题总览", "知识点总览", "学习看板", "知识库总览", "学习路线", "全部笔记索引"}
+    meta["knowledge"] = [k.strip() for k in meta["knowledge"] if k.strip() not in skip]
     return meta
 
 
-def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archived=False):
+def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archived=False, topic=None):
     """把每日计划同步一份进 Obsidian 库（plans/ 进行中，done/YYYY-MM/ 已归档）。"""
     if not OBS_ENABLED:
         return None
@@ -1598,7 +1694,7 @@ def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archiv
     os.makedirs(target_dir, exist_ok=True)
     target = os.path.join(target_dir, f"{iso}.md")
     if plan is not None and qmeta is not None:
-        header = _obsidian_plan_frontmatter(iso, plan, qmeta, review)
+        header = _obsidian_plan_frontmatter(iso, plan, qmeta, review, topic=topic)
     else:
         meta = _parse_plan_meta(md)
         header = [
@@ -1612,9 +1708,12 @@ def mirror_plan_to_obsidian(iso, md, plan=None, qmeta=None, review=False, archiv
             f"skill_station: {meta.get('station', '')}",
             f"leetcode: {meta.get('leetcode', '')}",
             f"review: {meta.get('review', '否')}",
-            "---",
-            "",
         ]
+        if meta.get("knowledge"):
+            header.append("knowledge:")
+            for k in meta["knowledge"]:
+                header.append(f'  - "{k}"')
+        header += ["---", ""]
     text = "\n".join(header) + md
     try:
         _write_lf(target, text)
@@ -1649,8 +1748,8 @@ def sync_obsidian_scripts():
     if os.path.abspath(BASE) == os.path.abspath(OBS_DAILY):
         return []
     copied = []
-    names = ("gen_daily.py", "run_daily.ps1", "done.ps1", "commit_evening.ps1",
-             "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", ".gitignore",
+    names = ("gen_daily.py", "knowledge_map.py", "run_daily.ps1", "done.ps1", "commit_evening.ps1",
+             "install_task.ps1", "open_daily.ps1", "remind_evening.ps1", "sync_all.ps1", ".gitignore",
              "state.json", "plan_config.json", "last_summary.txt", "last_run.json")
     for name in names:
         src = os.path.join(BASE, name)
@@ -1679,14 +1778,14 @@ def _collect_git_commits(iso):
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             continue
         try:
-            proc = subprocess.run(
+            proc = _run_quiet(
                 [
                     "git", "-C", repo_dir, "log",
                     f"--since={iso} 00:00:00",
                     f"--until={iso} 23:59:59",
                     "--pretty=format:%h %s",
                 ],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
+                timeout=5
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 for line in proc.stdout.strip().splitlines():
@@ -1706,9 +1805,9 @@ def _practice_ac_status_for_date(iso, h_entry):
     if not os.path.exists(prac_path) or not _extract_user_code(prac_path):
         return f"☑️ 已确认完成（`{fname}` 为网页端完成或未写本地代码）"
     try:
-        proc = subprocess.run(
+        proc = _run_quiet(
             [sys.executable, "-X", "utf8", prac_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8
+            timeout=8
         )
         if proc.returncode == 0 and "AC!" in (proc.stdout or ""):
             return f"✅ 本地代码已跑通 `AC!`（`{fname}`）"
@@ -1965,9 +2064,9 @@ def check_practice():
         print("CHECK_STATUS:todo")
         return
     try:
-        proc = subprocess.run(
+        proc = _run_quiet(
             [sys.executable, "-X", "utf8", prac_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
+            timeout=10
         )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
@@ -2016,6 +2115,50 @@ def cmd_stats():
         print(f"  {mark} {tp:<8}: {d_cnt}/{t_cnt}")
 
 
+def _inject_knowledge_field(note_path, num, topic):
+    """给 Obsidian 笔记补/更新 YAML frontmatter 里的 knowledge 字段（供知识点页的 Dataview 反查）。
+    只在 Obsidian 格式（有 YAML frontmatter）的笔记上操作；learning-notes 纯 Markdown 不处理。"""
+    if not note_path or not os.path.exists(note_path):
+        return False
+    main_k, rel_k = _knowledge_links(num, topic)
+    if not main_k:
+        return False
+    try:
+        with open(note_path, "r", encoding="utf-8-sig") as f:
+            nt = f.read()
+        if not nt.startswith("---\n"):
+            return False
+        end = nt.find("\n---", 4)
+        if end < 0:
+            return False
+        fm = nt[4:end]
+        body = nt[end + 4:]
+        # 已有 knowledge 字段：整段替换；否则插到 frontmatter 末尾
+        block = ["knowledge:"] + [f'  - "{main_k}"']
+        if rel_k:
+            block.append("knowledge_related:")
+            block += [f'  - "{r}"' for r in rel_k]
+        lines = fm.splitlines()
+        removed, kept, skipping = [], [], False
+        for line in lines:
+            if line.startswith("knowledge:") or line.startswith("knowledge_related:"):
+                skipping = True
+                removed.append(line)
+                continue
+            if skipping:
+                if line.startswith("  - "):
+                    removed.append(line)
+                    continue
+                skipping = False
+            kept.append(line)
+        new_fm = "\n".join(kept + block)
+        _write_lf(note_path, "---\n" + new_fm + nt[end:])
+        return True
+    except Exception as e:
+        print("inject knowledge failed:", e, file=sys.stderr)
+        return False
+
+
 def sync_notes_history():
     """将 state.json 中历史已刷过的所有题目回填到 learning-notes 与 Obsidian 两个笔记库。"""
     if not _note_stores():
@@ -2060,6 +2203,8 @@ def sync_notes_history():
             _set_note_state(note_path, num, qname, status_str,
                             iso=review_date.get(qi), review=(qi in review_date),
                             obsidian=(store["style"] == "obsidian"))
+            if store["style"] == "obsidian":
+                _inject_knowledge_field(note_path, num, topic)
         rows.append(f"| {num:04d} | [{qname}](notes/{note_fname}) | {diff_zh} | {topic} | {status_str} | {iso} |")
 
     readme_path = os.path.join(LC_NOTES_DIR, "README.md")
@@ -2222,16 +2367,23 @@ def cmd_open():
         prac_full = prac_obs
 
     files_to_open = [p for p in (plan_file, prac_full, note_path) if p and os.path.exists(p)]
+    # 只用 Code.exe（GUI 程序，不会创建控制台）；"code" 是 .cmd 包装，会闪黑窗
     code_candidates = [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Microsoft VS Code", "Code.exe"),
         r"C:\Program Files\Microsoft VS Code\Code.exe",
-        "code",
+        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
     ]
-    code_exe = next((c for c in code_candidates if c == "code" or os.path.exists(c)), "code")
-    try:
-        subprocess.Popen([code_exe] + files_to_open, shell=(code_exe == "code"))
-    except Exception as e:
-        print("open vscode failed:", e, file=sys.stderr)
+    code_exe = next((c for c in code_candidates if os.path.exists(c)), None)
+    if code_exe:
+        try:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = _NO_WINDOW
+            subprocess.Popen([code_exe] + files_to_open, **kwargs)
+        except Exception as e:
+            print("open vscode failed:", e, file=sys.stderr)
+    else:
+        print("VS Code Code.exe not found; skip opening editor", file=sys.stderr)
 
     url = f"https://leetcode.cn/problems/{slug}/"
     try:
